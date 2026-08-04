@@ -7,7 +7,7 @@ from apps.authproviders.providers.api_key import ApiKeyAuthProvider
 from apps.authproviders.providers.basic import BasicAuthProvider
 from apps.authproviders.providers.bearer import BearerAuthProvider
 from apps.authproviders.registry import available_auth_provider_types, get_auth_provider
-from apps.core.exceptions import AuthenticationError
+from apps.core.exceptions import AuthenticationError, ConfigurationError
 
 
 def _dummy_request() -> httpx.Request:
@@ -57,7 +57,14 @@ def test_registry_contains_builtin_providers():
     assert isinstance(get_auth_provider("bearer"), BearerAuthProvider)
 
 
-def test_unimplemented_providers_raise_not_implemented():
-    provider = get_auth_provider("token_endpoint")
-    with pytest.raises(NotImplementedError):
-        provider.prepare_request(_dummy_request(), {})
+def test_token_based_providers_are_registered_and_real():
+    # token_endpoint / multi_step_token are implemented (see
+    # apps/authproviders/tests/test_token_endpoint.py and
+    # test_multi_step.py for their full behavior) -- here we only check
+    # they're reachable through the registry and reject an empty
+    # credential with a clear ConfigurationError rather than a bare
+    # NotImplementedError or KeyError.
+    for type_key in ("token_endpoint", "multi_step_token"):
+        provider = get_auth_provider(type_key)
+        with pytest.raises(ConfigurationError):
+            provider.prepare_request(_dummy_request(), {})

@@ -10,7 +10,13 @@ class PipelineRun(TimeStampedModel):
     """One execution of a Pipeline. `idempotency_key` lets retriggering
     the same logical run (e.g. a scheduler retry after a worker crash) be
     a no-op instead of a duplicate load -- see
-    docs/architecture.md#idempotency."""
+    docs/architecture.md#idempotency.
+
+    `status` must only be changed through `apps.execution.claims`
+    (`claim_run`, `mark_run_succeeded`, `mark_run_failed`) -- those
+    enforce that a terminal run (SUCCEEDED/FAILED) can never move back to
+    RUNNING or PENDING. See docs/decisions/0005-execution-orchestration.md.
+    """
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -29,7 +35,28 @@ class PipelineRun(TimeStampedModel):
     idempotency_key = models.CharField(max_length=255, unique=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+
+    # --- execution state (Milestone 2) ------------------------------------
+    attempt = models.PositiveIntegerField(
+        default=0, help_text="Number of claim attempts made (Celery tries + retries)."
+    )
+    celery_task_id = models.CharField(max_length=255, null=True, blank=True)
+    last_successful_cursor = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Cursor of the last page fully extracted, stored, and loaded.",
+    )
+    pages_extracted = models.PositiveIntegerField(default=0)
+    records_extracted = models.PositiveIntegerField(default=0)
+    records_loaded = models.PositiveIntegerField(default=0)
+    raw_payload_count = models.PositiveIntegerField(default=0)
+
+    # Sanitized (apps.core.redaction) -- never raw exception text that
+    # might echo request/response content.
+    error_category = models.CharField(max_length=100, null=True, blank=True)
     error_message = models.TextField(null=True, blank=True)
+    error_is_retryable = models.BooleanField(null=True, blank=True, default=None)
 
     class Meta:
         ordering = ["-created_at"]
@@ -39,13 +66,14 @@ class PipelineRun(TimeStampedModel):
 
 
 class TaskExecution(TimeStampedModel):
-    """One step (extract/load/...) within a PipelineRun, tracked
-    separately so partial failures and per-step retries are visible in
-    execution history rather than collapsed into the run as a whole."""
+    """One attempt at executing a PipelineRun, tracked separately from the
+    run itself so retry history stays visible in execution history rather
+    than being collapsed/overwritten."""
 
     class Step(models.TextChoices):
         EXTRACT = "extract", "Extract"
         LOAD = "load", "Load"
+        RUN = "run", "Run"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"

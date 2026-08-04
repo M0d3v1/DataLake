@@ -1,29 +1,55 @@
-"""Minimal SQL Server destination connector.
+"""SQL Server destination connector.
 
 Reaches the destination exclusively through SQLAlchemy Core over pyodbc
 -- never through Django's ORM/`DATABASES`, and never with more than the
 credentials handed to it for this one operation (see
-docs/decisions/0004-internal-external-db-separation.md). `load()` here is
-a plain batched INSERT into an already-existing table; guided table/index
-creation and upsert semantics are Milestone 2 work.
+docs/decisions/0004-internal-external-db-separation.md). `load()` writes
+already-mapped records (destination column names as keys) into an
+existing table in bounded, single-transaction batches.
+
+This is at-least-once, not exactly-once: see
+docs/decisions/0005-execution-orchestration.md for the duplicate-risk
+window this implies when a worker crashes between a destination commit
+and the platform recording that success.
 """
 
+import re
 from typing import Any
 
 import sqlalchemy as sa
 
 from apps.connectors.base import DestinationCapabilities, DestinationConnector
 from apps.connectors.registry import register_destination
-from apps.core.exceptions import ConnectionTestFailed, LoadFailed, UnsupportedCapability
+from apps.core.exceptions import (
+    ConfigurationError,
+    ConnectionTestFailed,
+    LoadFailed,
+    SchemaMismatchError,
+    UnsupportedCapability,
+)
+
+DEFAULT_BATCH_SIZE = 500
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def _validate_sql_identifier(name: Any, *, label: str) -> str:
+    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
+        raise ConfigurationError(
+            f"{label} {name!r} is not a valid SQL identifier "
+            "(letters, digits, underscore; must not start with a digit; max 128 chars)"
+        )
+    return name
 
 
 @register_destination
 class SqlServerDestinationConnector(DestinationConnector):
     """Config:
       - host (str), port (int, default 1433), database (str)
+      - schema_name (str, default "dbo")
       - table_name (str): destination table `load()` writes into.
       - driver (str, default "ODBC Driver 18 for SQL Server")
       - extra_odbc_params (dict, optional): e.g. {"Encrypt": "yes"}
+      - batch_size (int, default 500): rows per bounded INSERT batch.
 
     `credential`:
       - username (str), password (secret)
@@ -48,7 +74,15 @@ class SqlServerDestinationConnector(DestinationConnector):
         )
 
     def _engine(self, credential: dict[str, Any]) -> sa.engine.Engine:
-        return sa.create_engine(self._build_url(credential), pool_pre_ping=True)
+        # hide_parameters: bound INSERT values (business data, not
+        # secrets) must not end up verbatim in exception text -- see
+        # apps.core.redaction and docs/decisions/0005-execution-orchestration.md.
+        return sa.create_engine(
+            self._build_url(credential),
+            pool_pre_ping=True,
+            hide_parameters=True,
+            fast_executemany=True,
+        )
 
     def test_connection(self, credential: dict[str, Any]) -> None:
         engine = self._engine(credential)
@@ -65,20 +99,71 @@ class SqlServerDestinationConnector(DestinationConnector):
     ) -> int:
         if mode != "append":
             raise UnsupportedCapability(
-                f"{self.type_key} destination connector does not support mode={mode!r} yet "
-                "(upsert is planned for Milestone 2)"
+                f"{self.type_key} destination connector only supports mode='append' "
+                f"(got {mode!r}); upsert/CDC are deliberately deferred, see the roadmap"
             )
         if not records:
             return 0
 
+        schema_name = _validate_sql_identifier(
+            self.config.get("schema_name", "dbo"), label="schema_name"
+        )
+        table_name = _validate_sql_identifier(self.config["table_name"], label="table_name")
+        batch_size = self.config.get("batch_size", DEFAULT_BATCH_SIZE)
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+            raise ConfigurationError(
+                "sqlserver destination: 'batch_size' must be a positive integer"
+            )
+
         engine = self._engine(credential)
         try:
-            metadata = sa.MetaData()
-            table = sa.Table(self.config["table_name"], metadata, autoload_with=engine)
+            table = self._reflect_table(engine, schema_name, table_name)
+            self._validate_columns(table, records, schema_name, table_name)
+
+            total_loaded = 0
             with engine.begin() as conn:
-                conn.execute(sa.insert(table), records)
+                for start in range(0, len(records), batch_size):
+                    batch = records[start : start + batch_size]
+                    conn.execute(sa.insert(table), batch)
+                    total_loaded += len(batch)
+            return total_loaded
+        except sa.exc.OperationalError as exc:
+            # Connectivity loss, lock-wait timeout, deadlock victim, etc.
+            # -- SQLAlchemy/pyodbc surface these as OperationalError across
+            # the board; a retry with a fresh connection can succeed.
+            raise LoadFailed(
+                f"database connectivity error during load: {exc}", retryable=True
+            ) from exc
+        except sa.exc.IntegrityError as exc:
+            raise LoadFailed(
+                f"integrity constraint violated during load: {exc}", retryable=False
+            ) from exc
         except sa.exc.SQLAlchemyError as exc:
-            raise LoadFailed(str(exc)) from exc
+            raise LoadFailed(str(exc), retryable=False) from exc
         finally:
             engine.dispose()
-        return len(records)
+
+    def _reflect_table(
+        self, engine: sa.engine.Engine, schema_name: str, table_name: str
+    ) -> sa.Table:
+        metadata = sa.MetaData(schema=schema_name)
+        try:
+            return sa.Table(table_name, metadata, autoload_with=engine, schema=schema_name)
+        except sa.exc.NoSuchTableError as exc:
+            raise SchemaMismatchError(
+                f"destination table {schema_name}.{table_name} does not exist"
+            ) from exc
+
+    def _validate_columns(
+        self, table: sa.Table, records: list[dict[str, Any]], schema_name: str, table_name: str
+    ) -> None:
+        known_columns = set(table.columns.keys())
+        record_columns: set[str] = set()
+        for record in records:
+            record_columns.update(record.keys())
+        unknown_columns = record_columns - known_columns
+        if unknown_columns:
+            raise SchemaMismatchError(
+                f"destination table {schema_name}.{table_name} has no column(s) "
+                f"{sorted(unknown_columns)}; known columns: {sorted(known_columns)}"
+            )

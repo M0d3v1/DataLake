@@ -39,6 +39,12 @@ class FetchResult:
     next_cursor: str | None
     raw_payload: bytes
     raw_content_type: str = "application/json"
+    # Optional, connector-specific metadata persisted onto the
+    # RawPayloadRecord for this page (apps.rawstore) -- all have safe
+    # defaults so existing connectors/tests that don't set them keep working.
+    cursor_used: str | None = None
+    source_path: str | None = None
+    http_status: int | None = None
 
 
 class SourceConnector(ABC):
@@ -53,9 +59,7 @@ class SourceConnector(ABC):
         """Raise `apps.core.exceptions.ConnectionTestFailed` on failure."""
 
     @abstractmethod
-    def fetch(
-        self, credential: dict[str, Any], cursor: str | None = None
-    ) -> Iterator[FetchResult]:
+    def fetch(self, credential: dict[str, Any], cursor: str | None = None) -> Iterator[FetchResult]:
         """Yield one `FetchResult` per page/batch, starting from `cursor`
         (None means "from the beginning"). Callers persist the last
         `next_cursor` they saw to support resuming/incremental sync,
@@ -95,9 +99,7 @@ class DestinationConnector(ABC):
         that support guided schema creation should override this and set
         `capabilities.supports_guided_schema_creation = True`.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support guided schema creation"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support guided schema creation")
 
     @abstractmethod
     def load(

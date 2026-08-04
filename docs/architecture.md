@@ -3,8 +3,12 @@
 DataLake is a modular-monolith data integration platform for insurance/insurtech:
 connect external REST APIs and databases, store what they return immutably,
 load it into a destination database, and do all of that on a schedule with a
-visible execution history. This document covers Milestone 1 (the
-architectural foundation) and notes what's deliberately deferred.
+visible execution history. Milestone 1 built the architectural foundation
+(interfaces, models, multi-tenancy). Milestone 2 makes the platform
+actually run pipelines end to end: a real extract -> raw-store -> map ->
+load flow with retries, resumable extraction, and duplicate-dispatch
+protection. This document reflects the current (M2) state and notes
+what's deliberately still deferred.
 
 ## Process topology
 
@@ -42,16 +46,13 @@ internals.
 | `orgs` | `Organization` (tenant), `Domain`, `Membership` (role per user per org) |
 | `accounts` | Custom `User` model |
 | `secrets` | `SecretStore` interface + default encrypted-field backend |
-| `authproviders` | `AuthProvider` interface + built-in providers (API key, Basic, Bearer, token-endpoint*, multi-step*) |
+| `authproviders` | `AuthProvider` interface + built-in providers (API key, Basic, Bearer, token-endpoint, multi-step) |
 | `connectors` | `SourceConnector` / `DestinationConnector` interfaces + registry + built-in connectors (REST API source, SQL Server destination) |
 | `connections` | `Connection` (which connector + config) and `Credential` (which auth provider + secret ref) |
-| `pipelines` | `Pipeline`: source, destination, mapping, schedule |
-| `execution` | `PipelineRun`, `TaskExecution`, the Celery task(s) that drive a run |
+| `pipelines` | `Pipeline` (source, destination, mapping, schedule) + `apps.pipelines.mapping` |
+| `execution` | `PipelineRun`, `TaskExecution`, `apps.execution.orchestration`/`claims`/`dispatch`/`retry_policy`, the Celery task |
 | `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata |
 | `auditing` | `AuditLog` + `record_audit_event()` |
-
-\* interface registered, implementation deferred to Milestone 2 -- see
-`apps/authproviders/providers/token_endpoint.py` and `multi_step.py`.
 
 ## Internal vs. external data access
 
@@ -85,30 +86,70 @@ connector construction time. `credential` (secret: resolved via
 `apps.secrets.get_secret_store()` immediately before use) is passed
 per-call and never stored on the connector instance.
 
-Built-in in Milestone 1: `rest_api` (page-number pagination, JSON list
-responses) and `sqlserver` (SQLAlchemy Core + pyodbc, append-only `load`).
-PostgreSQL source/destination and richer REST pagination are Milestone 2/3
-work.
+Built-in: `rest_api` (GET/POST, static params/headers/JSON body, a
+configurable nested records path, page-number pagination with a
+`page_size`-based short-page stop, a hard `max_pages` safety cap, and a
+one-shot re-authenticate-and-retry on a 401/403) and `sqlserver`
+(SQLAlchemy Core + pyodbc, identifier-validated schema+table, reflected
+and column-checked before load, bounded batched inserts in one
+transaction, append-only). PostgreSQL source/destination, SQL Server
+*source* queries, and upsert/CDC are still deferred -- see the roadmap.
 
 ## Authentication providers
 
 Authentication is a fixed, registrable set of provider *classes*
 (`apps/authproviders`), not user-supplied code -- this is a deliberate
 security boundary, not an oversight. Each provider implements
-`prepare_request(request, credential) -> request`. Built-in: `api_key`,
-`basic`, `bearer`. `token_endpoint` and `multi_step_token` are registered
-as extension points with `prepare_request` raising `NotImplementedError`
-until Milestone 2 implements the token-exchange/refresh state machine.
+`prepare_request(request, credential) -> request`. All five are real:
+`api_key`, `basic`, `bearer`, `token_endpoint` (single token-acquisition
+call, JSON-field or header extraction, optional expiry), and
+`multi_step_token` (a bounded, declarative sequence of up to 5 HTTP
+requests, later steps able to reference earlier steps' extracted values
+via `{{steps.name}}` / `{{credential.field}}` placeholder substitution --
+plain string substitution against a whitelist, never `eval`/`exec`/a
+template engine). Token-based providers cache their acquired token for
+the lifetime of one `SourceConnector.fetch()` call (one pipeline
+execution's extract phase) and re-acquire on expiry or after a source
+401/403 triggers `AuthProvider.invalidate()`. See
+`apps/authproviders/token_support.py` and
+[ADR 0005](decisions/0005-execution-orchestration.md).
+
+## Mapping
+
+`apps.pipelines.mapping.map_records` applies `Pipeline.destination_mapping`
+(destination_column -> source_field, dotted paths supported) to each
+extracted record: builds a new dict per record (never mutates the
+source), preserves explicit `null`s, and either substitutes `None` for a
+missing source field (permissive, the default) or raises `MappingError`
+(`Pipeline.strict_mapping = True`). Not a transformation language --
+one field reference per destination column, no expressions.
+
+## Execution orchestration
+
+`apps.execution.orchestration.run_pipeline` is the real flow (Celery task
+in `apps.execution.tasks` is a thin boundary around it): claim the run,
+resolve the source/destination connectors and credentials, then for each
+page from `source.fetch()`: store the raw payload, map the records, load
+them, and persist updated counters -- in that order, so a page's raw
+payload always exists before (and independent of) whether its load
+succeeds. See [ADR 0005](decisions/0005-execution-orchestration.md) for
+the full claiming/retry/duplicate-risk model, including what's
+deliberately still a known limitation (a hard-killed worker leaves a run
+stuck `RUNNING`; destination loads are at-least-once, not exactly-once).
 
 ## Idempotency
 
-`PipelineRun.idempotency_key` is unique. Re-triggering the same logical run
-(a scheduler retry after a worker crash, a manual re-run pointed at the same
-key) is meant to be safe rather than producing a duplicate load. In
-Milestone 1 this is a modeled constraint with no enforcement logic yet
-(there is no real load orchestration to make idempotent); Milestone 2 wires
-it into the actual extract/load chain, together with per-connector upsert
-semantics where `capabilities.supports_upsert` allows it.
+`PipelineRun.idempotency_key` is unique and is the mechanism
+`apps.execution.dispatch.trigger_manual_run` uses to avoid creating a
+second run (and enqueuing a second Celery task) for what should be one
+logical execution. Within a run, `apps.execution.claims.claim_run` uses
+`SELECT ... FOR UPDATE SKIP LOCKED` plus Celery-task-id ownership to stop
+two workers from executing the same run concurrently, and raw-payload
+metadata is `update_or_create`d on `(run, sequence)` so a retried page
+never duplicates its metadata row. What is **not** idempotent: the
+destination load itself (append-only INSERT, at-least-once) -- see
+[ADR 0005](decisions/0005-execution-orchestration.md) for the duplicate
+window this leaves and why it isn't hidden.
 
 ## Logging
 
@@ -128,14 +169,12 @@ extract/load steps and across processes.
 
 ## What's deliberately not here yet
 
-- Real extract -> raw-store -> map -> load orchestration (Milestone 2).
-- Guided destination table/index creation (Milestone 2).
-- Multi-step token auth and token-endpoint auth implementations (Milestone 2).
-- Scheduling (Celery beat actually triggering runs), incremental sync
-  watermarks, retry/backoff policy (Milestone 3).
-- PostgreSQL source/destination connectors (Milestone 3).
-- Restricted advanced SQL execution -- deliberately deferred pending its
-  own design review; this is the highest-risk feature in the product (see
-  the design proposal / risk list from Milestone 1 planning).
-- A REST API for programmatic access (DRF) -- not excluded by design, just
-  not needed yet; the module boundaries above don't preclude adding it.
+See `docs/roadmap.md` for the full list with rationale. In short:
+scheduling (Celery beat actually triggering runs), PostgreSQL
+source/destination connectors, SQL Server *source* queries, guided
+destination table/index/relationship design, upsert/CDC and incremental
+watermarks across runs, unrestricted custom SQL, a normal-user web UI,
+production secret-manager integration, and analytics dashboards.
+Restricted advanced SQL execution in particular is deliberately deferred
+pending its own design review -- it's the highest-risk feature in the
+product (see the Milestone 1 design proposal's risk list).

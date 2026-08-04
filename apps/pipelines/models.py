@@ -34,8 +34,12 @@ class Pipeline(TimeStampedModel):
     # (e.g. a specific path/query) on top of the Connection's own config.
     extraction_config = models.JSONField(default=dict, blank=True)
     # destination_column -> source_field, mirrors
-    # apps.connectors.base.DestinationMapping.
+    # apps.connectors.base.DestinationMapping. Applied by
+    # apps.pipelines.mapping before records reach the destination connector.
     destination_mapping = models.JSONField(default=dict, blank=True)
+    # See apps.pipelines.mapping.map_record: strict raises on a missing
+    # source field instead of substituting null.
+    strict_mapping = models.BooleanField(default=False)
     schedule_cron = models.CharField(max_length=100, null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_by = models.ForeignKey(
