@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run.id }}{% endblock %}
+{% block content %}
+<p><a href="{% url 'opsui_tenant:run_list' pipeline_id=pipeline.id %}">&larr; {{ pipeline.name }} runs</a></p>
+<h1>Run <code>{{ run.id }}</code></h1>
+
+<div class="card">
+    <dl class="kv">
+        <dt>Pipeline</dt><dd>{{ pipeline.name }}</dd>
+        <dt>Status</dt><dd><span class="badge badge-{{ run.status }}">{{ run.get_status_display }}</span></dd>
+        <dt>Error category</dt><dd>{{ run.error_category|default:"-" }}</dd>
+        <dt>Error message</dt><dd>{{ run.error_message|default:"-" }}</dd>
+        <dt>Pages extracted</dt><dd>{{ run.pages_extracted }}</dd>
+        <dt>Records extracted</dt><dd>{{ run.records_extracted }}</dd>
+        <dt>Records loaded</dt><dd>{{ run.records_loaded }}</dd>
+        <dt>Last successful cursor</dt><dd><code>{{ run.last_successful_cursor|default:"-" }}</code></dd>
+        <dt>Continued from</dt><dd>{% if run.continued_from_id %}<a href="{% url 'opsui_tenant:run_detail' pipeline_id=pipeline.id run_id=run.continued_from_id %}"><code>{{ run.continued_from_id }}</code></a>{% else %}-{% endif %}</dd>
+    </dl>
+</div>
+
+{% if is_continuable %}
+    {% if existing_continuation %}
+        <div class="card">
+            <h2>Continuation</h2>
+            <p>This run already has a continuation.</p>
+            <a class="btn secondary" href="{% url 'opsui_tenant:run_detail' pipeline_id=pipeline.id run_id=existing_continuation.id %}">
+                View continuation run <code>{{ existing_continuation.id }}</code>
+            </a>
+        </div>
+    {% elif can_continue %}
+        <div class="card">
+            <h2>Continue from saved cursor</h2>
+            <p class="warning">
+                This run failed after reaching the source's page-limit safety cap
+                (<code>PageLimitExceededError</code>) with more data possibly remaining.
+                A <strong>plain new run would start from the beginning</strong> and
+                duplicate every page already loaded by this run. Continuing instead
+                dispatches a new run seeded with this run's saved cursor and counters.
+            </p>
+            <dl class="kv">
+                <dt>Failed run</dt><dd><code>{{ run.id }}</code></dd>
+                <dt>Pipeline</dt><dd>{{ pipeline.name }}</dd>
+                <dt>Saved cursor</dt><dd><code>{{ run.last_successful_cursor|default:"-" }}</code></dd>
+                <dt>Pages completed</dt><dd>{{ run.pages_extracted }}</dd>
+                <dt>Records loaded</dt><dd>{{ run.records_loaded }}</dd>
+            </dl>
+            <p class="muted">
+                Note: destination delivery remains at-least-once, not exactly-once --
+                see ADR 0005. This does not change with a continuation run.
+            </p>
+            <form method="post" action="{% url 'opsui_tenant:run_continue' pipeline_id=pipeline.id run_id=run.id %}"
+                  onsubmit="return confirm('Dispatch a continuation run for {{ run.id }}?');">
+                {% csrf_token %}
+                <button class="btn" type="submit">Continue from saved cursor</button>
+            </form>
+        </div>
+    {% else %}
+        <div class="warning">You do not have permission to continue this run.</div>
+    {% endif %}
+{% endif %}
+{% endblock %}

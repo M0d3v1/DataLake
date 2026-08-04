@@ -49,6 +49,37 @@ Saving the `Organization` automatically creates and migrates its schema
 (`auto_create_schema = True`) -- you don't run `migrate_schemas` again for
 each new tenant.
 
+Add `acme.localhost` (or whatever domain you chose) to your `/etc/hosts`
+pointing at `127.0.0.1` so it resolves locally.
+
+## Using the internal operator UI
+
+See [ADR 0008](decisions/0008-internal-operator-ui.md) for the design.
+There's no signup flow yet -- create a user (and, for platform-operator
+access, mark them staff) via the shell:
+
+```bash
+docker compose run --rm web python manage.py shell -c "
+from django.contrib.auth import get_user_model
+from apps.orgs.models import Membership, Organization
+
+User = get_user_model()
+user = User.objects.create_user(username='alice', email='alice@example.test', password='change-me', is_staff=True)
+org = Organization.objects.get(schema_name='acme')
+Membership.objects.create(user=user, organization=org, role=Membership.Role.ADMIN)
+"
+```
+
+- **Raw payload migration tool** (platform operators, `is_staff=True`):
+  visit `http://localhost:8000/ops/` on a hostname that matches *no*
+  tenant `Domain` (plain `localhost`, not `acme.localhost`) -- that's
+  what routes to the public-schema operator UI rather than a specific
+  tenant. Log in, pick an organization, run a dry-run inspection.
+- **Pipeline runs + continuation** (organization owners/admins/engineers):
+  visit `http://acme.localhost:8000/pipelines/<pipeline-id>/runs/` on
+  the organization's *own* domain -- the tenant is resolved from that
+  domain, never from a URL parameter.
+
 ## Running tests
 
 ```bash

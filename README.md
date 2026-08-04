@@ -13,13 +13,14 @@ restricted advanced SQL).
 
 ## Status
 
-**Milestone 2, plus a correctness/security hardening pass and a
-follow-up review-fix pass.** A fictional authenticated, paginated REST
-API can be configured as a source, its responses are stored immutably
-before mapping, mapped records are loaded into a SQL Server destination
-in bounded batches, and the whole run is manually triggerable, retried,
-resumed via an explicit continuation after a page-limit failure, and
-recorded in execution history. Runs on Django 5.2 LTS. See
+**Milestone 2, a correctness/security hardening pass, a follow-up
+review-fix pass, and a minimal internal operator UI.** A fictional
+authenticated, paginated REST API can be configured as a source, its
+responses are stored immutably before mapping, mapped records are loaded
+into a SQL Server destination in bounded batches, and the whole run is
+manually triggerable, retried, resumed via an explicit continuation
+after a page-limit failure, and recorded in execution history. Runs on
+Django 5.2 LTS. See
 [docs/architecture.md](docs/architecture.md) for what's built vs.
 deliberately deferred, [docs/decisions/](docs/decisions/) for the
 reasoning behind the major structural choices, and
@@ -132,13 +133,45 @@ python manage.py run_pipeline <pipeline-id> --schema <tenant-schema> \
     --continue-from <failed-run-id>
 ```
 
+The same continuation action is available from the operator UI's run
+detail page (below), for anyone who'd rather not use a shell.
+
+## Operator UI
+
+A minimal internal operator UI (Django templates + HTMX, no SPA) covers
+the two workflows that previously required shell access -- see
+[ADR 0008](docs/decisions/0008-internal-operator-ui.md) for the full
+design rationale:
+
+- **Raw payload storage migration** (`/ops/`, platform operators only --
+  `User.is_staff`): pick an organization, run a dry-run inspection, review
+  a safe summary (counts only -- never raw payload contents, storage
+  credentials, signed URLs, secrets, or tokens), start a real migration,
+  watch progress via HTMX polling, retry a stalled job, export a summary.
+  Same headless fallback as before:
+  ```bash
+  python manage.py migrate_raw_payload_storage --schema <tenant-schema> --dry-run
+  ```
+- **Pipeline run detail + continuation** (each organization's own domain,
+  owners/admins/engineers): view a run's status/cursor/counters, and --
+  for a run that failed with `PageLimitExceededError` -- a "Continue from
+  saved cursor" action with the same safeguards as the CLI (only one
+  continuation per failed run; disabled for a successful, running, or
+  differently-failed run).
+
+Both the web UI and the management commands call the exact same
+application services (`apps.rawstore.migration`,
+`apps.execution.dispatch`) -- neither duplicates the other's logic, and
+neither is the only supported way to do either workflow.
+
 ## Stack
 
 Python / Django (web) + Celery/RabbitMQ (worker, scheduler) + PostgreSQL
 (platform metadata, via django-tenants for schema-per-tenant isolation) +
 SQLAlchemy Core (external database access) + HTTPX (API access) + MinIO/S3
-(immutable raw payload storage) + HTMX/Alpine (UI). See
-[docs/architecture.md](docs/architecture.md).
+(immutable raw payload storage) + Django templates/HTMX (internal
+operator UI -- see [ADR 0008](docs/decisions/0008-internal-operator-ui.md)).
+See [docs/architecture.md](docs/architecture.md).
 
 ## Getting started
 
@@ -157,7 +190,8 @@ tests: [docs/setup.md](docs/setup.md).
 ## Repository layout
 
 ```
-config/            Django project settings, Celery app, URLconf
+config/            Django project settings, Celery app, URLconf (tenant +
+                    public-schema urlconfs -- see ADR 0008)
 apps/
   core/            Shared base models, exceptions, structured logging,
                     outbound_http (shared SSRF-hardened HTTP policy)
@@ -172,8 +206,11 @@ apps/
   execution/       PipelineRun, TaskExecution, orchestration/claims/dispatch/
                     retry_policy, the Celery task, `run_pipeline` management command
   rawstore/        RawPayloadStore interface + S3/MinIO backend (tenant-scoped,
-                    content-addressed, never-overwrite), `provision_raw_store` command
+                    content-addressed, never-overwrite), migration service +
+                    `provision_raw_store`/`migrate_raw_payload_storage` commands
   auditing/        AuditLog + record_audit_event()
+  opsui/           Internal operator UI: raw payload migration job model +
+                    Celery task, permissions, views/urls/templates (see ADR 0008)
 docs/
   architecture.md  Module boundaries, key abstractions, what's deferred
   setup.md         Local development guide

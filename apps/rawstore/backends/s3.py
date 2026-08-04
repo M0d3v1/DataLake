@@ -231,7 +231,12 @@ class S3RawPayloadStore(RawPayloadStore):
                 )
         return data
 
-    def _parse_and_authorize(self, uri: str) -> tuple[str, str]:
+    def _parse_uri(self, uri: str) -> tuple[str, str]:
+        """Parse `uri` into (bucket, key), validating shape and bucket
+        only -- deliberately stops short of the tenant-prefix check
+        `_parse_and_authorize` adds on top, since `apps.rawstore.migration`
+        legitimately needs to inspect objects under a *different* (legacy)
+        prefix than the current tenant's."""
         if not uri.startswith(_URI_SCHEME):
             raise RawPayloadAccessDenied(f"not a valid raw payload URI: {uri!r}")
         bucket, _, key = uri[len(_URI_SCHEME) :].partition("/")
@@ -241,6 +246,25 @@ class S3RawPayloadStore(RawPayloadStore):
             raise RawPayloadAccessDenied(
                 f"refusing to read from bucket {bucket!r}; only {self._bucket!r} is configured"
             )
+        return bucket, key
+
+    def get_raw_by_key(self, key: str) -> tuple[bytes, str | None]:
+        """Download an object by its exact, already-tenant-scoped key,
+        bypassing tenant-prefix authorization and content-addressed
+        checksum verification -- for `apps.rawstore.migration` only,
+        which is explicitly reading objects under legacy (pre-migration)
+        keys that would otherwise fail both of those checks. Returns
+        `(data, content_type)`."""
+        response = self._client.get_object(Bucket=self._bucket, Key=key)
+        data = response["Body"].read()
+        return data, response.get("ContentType")
+
+    def key_exists(self, key: str) -> bool:
+        """Public wrapper around `_exists` for `apps.rawstore.migration`."""
+        return self._exists(key)
+
+    def _parse_and_authorize(self, uri: str) -> tuple[str, str]:
+        bucket, key = self._parse_uri(uri)
         tenant_prefix = key.split("/", 1)[0]
         if tenant_prefix != self._tenant_uuid():
             raise RawPayloadAccessDenied(

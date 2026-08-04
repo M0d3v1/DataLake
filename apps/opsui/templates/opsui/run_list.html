@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ pipeline.name }} &middot; runs{% endblock %}
+{% block content %}
+<p><a href="{% url 'opsui_tenant:tenant_home' %}">&larr; pipelines</a></p>
+<h1>{{ pipeline.name }} &middot; runs</h1>
+<div class="card">
+    <table>
+        <thead><tr><th>Run</th><th>Status</th><th>Error category</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for run in runs %}
+            <tr>
+                <td><a href="{% url 'opsui_tenant:run_detail' pipeline_id=pipeline.id run_id=run.id %}"><code>{{ run.id }}</code></a></td>
+                <td><span class="badge badge-{{ run.status }}">{{ run.get_status_display }}</span></td>
+                <td>{{ run.error_category|default:"-" }}</td>
+                <td>{{ run.created_at }}</td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="4" class="muted">No runs yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

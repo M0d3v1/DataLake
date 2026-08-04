@@ -14,6 +14,17 @@ from apps.pipelines.models import Pipeline
 _CONTINUABLE_ERROR_CATEGORY = "PageLimitExceededError"
 
 
+def is_continuable(run: PipelineRun) -> bool:
+    """Whether `run` is eligible to be passed as `continue_from` --
+    the same rule `trigger_manual_run` enforces, exposed so callers (the
+    operator UI's run-detail page) can decide whether to show a
+    "Continue from saved cursor" action without duplicating the check."""
+    return (
+        run.status == PipelineRun.Status.FAILED
+        and run.error_category == _CONTINUABLE_ERROR_CATEGORY
+    )
+
+
 def trigger_manual_run(
     pipeline: Pipeline,
     *,

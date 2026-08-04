@@ -23,9 +23,12 @@ ceilings on response size and timeouts, `trust_env=False` on every HTTP
 client, a stable tenant UUID (not `schema_name`) and atomic create-only
 writes for raw payload storage, a data migration correcting
 `loaded_successfully` on rows that predated that field, redirect-target
-sanitization before logging, and the Django 5.2 LTS upgrade. This
-document reflects the current state and notes what's deliberately still
-deferred.
+sanitization before logging, and the Django 5.2 LTS upgrade. Most
+recently, a minimal internal operator UI (Django templates + HTMX) made
+two previously shell-only workflows -- raw payload storage migration and
+pipeline-run continuation -- reachable without shell access (see
+[ADR 0008](decisions/0008-internal-operator-ui.md)). This document
+reflects the current state and notes what's deliberately still deferred.
 
 ## Process topology
 
@@ -68,8 +71,9 @@ internals.
 | `connections` | `Connection` (which connector + config), `Credential` (which auth provider + secret ref), `AllowedOutboundHost` (tenant-level outbound policy allowlist) |
 | `pipelines` | `Pipeline` (source, destination, mapping, schedule) + `apps.pipelines.mapping` |
 | `execution` | `PipelineRun`, `TaskExecution`, `apps.execution.orchestration`/`claims`/`dispatch`/`retry_policy`, the Celery task |
-| `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata |
+| `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata, `apps.rawstore.migration` (legacy-key migration service) |
 | `auditing` | `AuditLog` + `record_audit_event()` |
+| `opsui` | Internal operator UI: `RawPayloadMigrationJob` (public schema), permissions, views/urls/templates for raw payload migration and pipeline run/continuation -- see [ADR 0008](decisions/0008-internal-operator-ui.md) |
 
 ## Internal vs. external data access
 
@@ -219,6 +223,30 @@ idempotent: the destination load itself (append-only INSERT,
 at-least-once) -- see [ADR 0005](decisions/0005-execution-orchestration.md)
 for the duplicate window this leaves and why it isn't hidden.
 
+## Internal operator UI
+
+`apps.opsui` (Django templates + HTMX, no SPA/new frontend framework) is
+the first web UI in this codebase -- everything before it was
+API/service-layer plus CLI management commands. Two url modules, matching
+two audiences that don't share a tenant context: `apps.opsui.urls_public`
+(served via `config/urls_public.py`, `PUBLIC_SCHEMA_URLCONF`) is the
+platform-operator-facing raw payload migration tool, where an
+organization is picked from a server-rendered list; `apps.opsui.urls_tenant`
+(served via `config/urls.py`, `ROOT_URLCONF`) is pipeline run
+listing/detail and the continuation action, reached on each
+organization's own domain with `request.tenant` already resolved by
+`TenantMainMiddleware` -- no URL here ever takes a tenant/schema
+identifier as a parameter. Both call the same application services
+(`apps.rawstore.migration`, `apps.execution.dispatch`) the equivalent
+management commands (`migrate_raw_payload_storage`, `run_pipeline
+--continue-from`) call, so the UI and the CLI can never drift apart.
+Long-running work (the migration job) runs in a Celery task tracked by
+`RawPayloadMigrationJob`, polled from the browser via HTMX, never inline
+in the request/response cycle. See
+[ADR 0008](decisions/0008-internal-operator-ui.md) for the full design,
+including why the job model lives in the public schema and how retry
+safety follows directly from the migration service's own idempotency.
+
 ## Logging
 
 Framework logs (Django, Celery internals) go through the plain stdlib
@@ -241,8 +269,10 @@ See `docs/roadmap.md` for the full list with rationale. In short:
 scheduling (Celery beat actually triggering runs), PostgreSQL
 source/destination connectors, SQL Server *source* queries, guided
 destination table/index/relationship design, upsert/CDC and incremental
-watermarks across runs, unrestricted custom SQL, a normal-user web UI,
-production secret-manager integration, and analytics dashboards.
-Restricted advanced SQL execution in particular is deliberately deferred
-pending its own design review -- it's the highest-risk feature in the
-product (see the Milestone 1 design proposal's risk list).
+watermarks across runs, unrestricted custom SQL, a self-service
+normal-user web UI (configuring connections/pipelines -- distinct from
+the internal operator UI, which now exists), production secret-manager
+integration, and analytics dashboards. Restricted advanced SQL execution
+in particular is deliberately deferred pending its own design review --
+it's the highest-risk feature in the product (see the Milestone 1 design
+proposal's risk list).

@@ -1,0 +1,21 @@
+{% if not job.is_terminal %}
+<div id="migration-job-progress"
+     hx-get="{% url 'opsui:migration_job_progress' job_id=job.id %}"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML">
+{% else %}
+<div id="migration-job-progress">
+{% endif %}
+    <p><span class="badge badge-{{ job.status }}">{{ job.get_status_display }}</span></p>
+    <dl class="kv">
+        <dt>Records inspected</dt><dd>{{ job.records_inspected }}</dd>
+        <dt>Already migrated</dt><dd>{{ job.already_migrated }}</dd>
+        <dt>Legacy unprefixed</dt><dd>{{ job.legacy_unprefixed }}</dd>
+        <dt>Schema-prefixed</dt><dd>{{ job.schema_prefixed }}</dd>
+        <dt>Missing objects</dt><dd>{{ job.missing_objects }}</dd>
+        <dt>Checksum conflicts</dt><dd>{{ job.checksum_conflicts }}</dd>
+        <dt>Ready for migration</dt><dd>{{ job.ready_for_migration }}</dd>
+        <dt>Records migrated</dt><dd>{{ job.records_migrated }}</dd>
+        <dt>Records skipped</dt><dd>{{ job.records_skipped }}</dd>
+    </dl>
+</div>

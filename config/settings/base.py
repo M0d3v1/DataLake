@@ -32,6 +32,11 @@ SHARED_APPS = [
     "apps.core",
     "apps.orgs",
     "apps.accounts",
+    # Internal operator UI (Django templates + HTMX, no SPA). Lives in
+    # SHARED_APPS because RawPayloadMigrationJob must be listable across
+    # every tenant by a platform operator without switching schema first
+    # -- see apps.opsui and docs/decisions/0008-internal-operator-ui.md.
+    "apps.opsui",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -75,6 +80,15 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = "config.urls"
+
+# django-tenants: a hostname that matches no tenant Domain (e.g. the bare
+# operator-facing hostname, with no per-org subdomain) serves the public
+# schema instead of a 404 -- this is how the internal operator UI at
+# PUBLIC_SCHEMA_URLCONF is reached, without requiring a dedicated "public"
+# tenant Domain row to be provisioned. See apps.opsui and
+# docs/decisions/0008-internal-operator-ui.md.
+SHOW_PUBLIC_IF_NO_TENANT_FOUND = True
+PUBLIC_SCHEMA_URLCONF = "config.urls_public"
 
 TEMPLATES = [
     {
@@ -128,6 +142,10 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+LOGIN_URL = "login"
+LOGIN_REDIRECT_URL = "/ops/"
+LOGOUT_REDIRECT_URL = "login"
 
 # --------------------------------------------------------------------------
 # Celery

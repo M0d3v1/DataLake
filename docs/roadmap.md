@@ -70,9 +70,17 @@ textbox, per the original Milestone 1 risk assessment.
 
 ## Normal-user web UI
 
-Everything so far is API/service-layer plus one CLI management command.
-The Django templates/HTMX/Alpine UI for configuring connections,
-pipelines, and viewing execution history is unbuilt.
+An **internal operator UI** now exists (Django templates + HTMX, no SPA
+-- see [ADR 0008](decisions/0008-internal-operator-ui.md)): raw payload
+storage migration for platform operators, and pipeline run
+listing/detail/continuation for organization owners/admins/engineers.
+What's still unbuilt is the **normal-user** (self-service, tenant-facing)
+UI: configuring connections, credentials, and pipelines; guided
+destination table creation; browsing full execution history beyond the
+last 50 runs. The operator UI's tenant urlconf
+(`apps.opsui.urls_tenant`, `config/urls.py`) and its
+domain-resolves-the-tenant pattern is the natural foundation to extend
+for that, rather than a separate UI stack.
 
 ## Production secret-manager integration
 

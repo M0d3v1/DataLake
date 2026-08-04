@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Organizations{% endblock %}
+{% block content %}
+<h1>Organizations</h1>
+<p class="muted">
+    {% if request.user.is_staff %}
+        Showing every organization (platform operator).
+    {% else %}
+        Showing organizations where you are an owner or admin.
+    {% endif %}
+</p>
+<div class="card">
+    <table>
+        <thead><tr><th>Organization</th><th>Schema</th><th></th></tr></thead>
+        <tbody>
+        {% for organization in organizations %}
+            <tr>
+                <td>{{ organization.name }}</td>
+                <td><code>{{ organization.schema_name }}</code></td>
+                <td><a class="btn secondary" href="{% url 'opsui:migration_org_detail' org_id=organization.id %}">Raw payload migration</a></td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="3" class="muted">No organizations available to you.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
