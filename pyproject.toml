@@ -1,0 +1,54 @@
+[project]
+name = "datalake"
+version = "0.1.0"
+description = "Open-source data integration platform for insurance and insurtech"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+readme = "README.md"
+
+dependencies = [
+    "Django>=5.0,<5.1",
+    "django-tenants>=3.6,<3.8",
+    "psycopg[binary]>=3.1,<3.2",
+    "celery>=5.3,<5.5",
+    "amqp>=5.2,<5.3",
+    "cryptography>=42.0,<43.0",
+    "httpx>=0.27,<0.28",
+    "SQLAlchemy>=2.0,<2.1",
+    "pyodbc>=5.1,<5.2",
+    "boto3>=1.34,<2.0",
+    "pydantic>=2.6,<3.0",
+    "pydantic-settings>=2.2,<3.0",
+    "structlog>=24.1,<25.0",
+    "django-htmx>=1.17,<1.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-django>=4.8,<5.0",
+    "pytest-cov>=5.0,<6.0",
+    "factory-boy>=3.3,<3.4",
+    "respx>=0.21,<0.22",
+    "ruff>=0.4,<0.5",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings.test"
+python_files = ["test_*.py"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["*/migrations/*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["apps*", "config*"]
