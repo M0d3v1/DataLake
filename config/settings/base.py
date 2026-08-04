@@ -171,8 +171,11 @@ SECRET_STORE_BACKEND = "apps.secrets.backends.encrypted_field.EncryptedFieldSecr
 # through this policy. See docs/decisions/0006-outbound-http-security-policy.md.
 # --------------------------------------------------------------------------
 OUTBOUND_HTTP_ALLOWED_PRIVATE_HOSTS = env.outbound_http_allowed_private_hosts_list()
+OUTBOUND_HTTP_ALLOWED_UNSAFE_HOSTS = env.outbound_http_allowed_unsafe_hosts_list()
 OUTBOUND_HTTP_ALLOW_INSECURE_HTTP = env.outbound_http_allow_insecure_http
+OUTBOUND_HTTP_INSECURE_ALLOWED_HOSTS = env.outbound_http_insecure_allowed_hosts_list()
 OUTBOUND_HTTP_MAX_RESPONSE_BYTES = env.outbound_http_max_response_bytes
+OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS = env.outbound_http_max_timeout_seconds
 
 # --------------------------------------------------------------------------
 # Structured logging. Django's own framework logs go through the plain

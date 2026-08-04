@@ -12,8 +12,20 @@ release blockers: pagination that could silently truncate a run instead
 of failing it, raw payload storage that could overwrite itself on a
 conflicting retry, and outbound HTTP requests with no SSRF protection
 (see [ADR 0006](decisions/0006-outbound-http-security-policy.md) and
-[ADR 0007](decisions/0007-raw-payload-immutability.md)). This document
-reflects the current state and notes what's deliberately still deferred.
+[ADR 0007](decisions/0007-raw-payload-immutability.md)). A follow-up
+review-fix pass then closed the remaining gaps found in that hardening
+work: a real cross-run continuation mechanism after
+`PageLimitExceededError` (Milestone 2's own resumption only covered a
+retry of the *same* run), corrected outbound allowlist semantics
+(private-host allowlisting no longer implicitly permits plain HTTP or
+bypasses loopback/link-local/cloud-metadata), deployment-wide hard
+ceilings on response size and timeouts, `trust_env=False` on every HTTP
+client, a stable tenant UUID (not `schema_name`) and atomic create-only
+writes for raw payload storage, a data migration correcting
+`loaded_successfully` on rows that predated that field, redirect-target
+sanitization before logging, and the Django 5.2 LTS upgrade. This
+document reflects the current state and notes what's deliberately still
+deferred.
 
 ## Process topology
 
@@ -131,15 +143,26 @@ requests. See `apps/authproviders/token_support.py` and
 tenant-configured URL -- REST source requests, token-endpoint and
 multi-step authentication requests, and connection tests all go through
 `build_client()`/`guarded_send()` here, never bare httpx. It refuses
-non-http(s) schemes, credentials embedded in a URL, and destinations that
-resolve to loopback, link-local (which covers cloud metadata endpoints --
-they all live in the link-local range), multicast, unspecified, or
-private addresses, unless the host is explicitly allowlisted
-(deployment-wide via `settings.OUTBOUND_HTTP_ALLOWED_PRIVATE_HOSTS`, or
-per-tenant via `apps.connections.models.AllowedOutboundHost`). Redirects
-are never followed. Timeouts are bounded on every phase (connect/read/
-write/pool). Response bodies are read under a hard, configurable size
-cap with early abort, never fully buffered first. See
+non-http(s) schemes and credentials embedded in a URL; resolves the host
+and refuses destinations that are loopback, link-local (which covers
+cloud metadata endpoints -- they all live in the link-local range),
+multicast, unspecified, or private, unless explicitly allowlisted --
+allowlisting is layered, not one flag: a plain host allowlist
+(deployment-wide `settings.OUTBOUND_HTTP_ALLOWED_PRIVATE_HOSTS`, or
+per-tenant `apps.connections.models.AllowedOutboundHost`) bypasses only
+the "private" category, while the higher-risk categories
+(loopback/link-local/multicast/unspecified) require the separate,
+deployment-only `settings.OUTBOUND_HTTP_ALLOWED_UNSAFE_HOSTS`. Plain
+`http://` requires its own, separate permission
+(`OUTBOUND_HTTP_ALLOW_INSECURE_HTTP` or `OUTBOUND_HTTP_INSECURE_ALLOWED_HOSTS`)
+-- being on a destination allowlist never implies it. Redirects are
+never followed, and a refused redirect's target is sanitized (query
+string/fragment/credentials stripped) before it reaches an error message
+or log line. Timeouts and response size are bounded on every call, at a
+deployment-wide hard ceiling a connection's own config may lower but
+never exceed. `httpx.Client` instances never trust the process
+environment for proxy/netrc configuration (`trust_env=False`) -- proxy
+support, if needed, is explicit and deployment-controlled. See
 [ADR 0006](decisions/0006-outbound-http-security-policy.md), including
 the documented DNS-rebinding residual risk this pass doesn't close.
 
@@ -161,8 +184,13 @@ resolve the source/destination connectors and credentials, then for each
 page from `source.fetch()`: store the raw payload, map the records, load
 them, and persist updated counters -- in that order, so a page's raw
 payload always exists before (and independent of) whether its load
-succeeds. See [ADR 0005](decisions/0005-execution-orchestration.md) for
-the full claiming/retry/duplicate-risk model, including what's
+succeeds. A run that fails with `PageLimitExceededError` is resumed via
+an explicit continuation run (`apps.execution.dispatch.trigger_manual_run(
+..., continue_from=failed_run)`, or `manage.py run_pipeline
+--continue-from <run_id>`), which seeds the new run's cursor/counters
+from the failed one rather than restarting extraction from `start_page`.
+See [ADR 0005](decisions/0005-execution-orchestration.md) for the full
+claiming/retry/duplicate-risk/continuation model, including what's
 deliberately still a known limitation (a hard-killed worker leaves a run
 stuck `RUNNING`; destination loads are at-least-once, not exactly-once).
 
@@ -174,12 +202,19 @@ second run (and enqueuing a second Celery task) for what should be one
 logical execution. Within a run, `apps.execution.claims.claim_run` uses
 `SELECT ... FOR UPDATE SKIP LOCKED` plus Celery-task-id ownership to stop
 two workers from executing the same run concurrently. Raw-payload storage
-is content-addressed (the object key includes a checksum of the bytes):
-a retried page with identical bytes reuses the same object and the same
-`RawPayloadRecord` row (`get_or_create` on `(run, sequence, checksum)`);
-a retried page with *different* bytes gets a genuinely new object and a
-second row, rather than one silently overwriting the other -- see
-[ADR 0007](decisions/0007-raw-payload-immutability.md). What is **not**
+is content-addressed (the object key includes a checksum of the bytes)
+and tenant-scoped by a stable `Organization.tenant_uuid` (not
+`schema_name`, and not the tenant's sequential integer `id`): a retried
+page with identical bytes reuses the same object -- verified, not just
+assumed, via a size check before treating it as a safe reuse -- and the
+same `RawPayloadRecord` row (`get_or_create` on
+`(run, sequence, checksum)`); a retried page with *different* bytes gets
+a genuinely new object and a second row, rather than one silently
+overwriting the other -- see
+[ADR 0007](decisions/0007-raw-payload-immutability.md), including the
+distinction it draws between this application-level guarantee and a
+storage-level one (e.g. S3 Object Lock), which this codebase doesn't
+configure for you. What is **not**
 idempotent: the destination load itself (append-only INSERT,
 at-least-once) -- see [ADR 0005](decisions/0005-execution-orchestration.md)
 for the duplicate window this leaves and why it isn't hidden.

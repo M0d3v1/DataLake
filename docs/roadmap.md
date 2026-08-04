@@ -50,11 +50,15 @@ express "what changed since X."
 ## Incremental sync watermarks across runs
 
 Milestone 2 resumes a *single* run from its own `last_successful_cursor`
-after a retry. It does not yet carry a watermark *between* separate runs
-(e.g. "only fetch policies updated since the last successful run") --
-every fresh run currently starts from `start_page`/the beginning.
-`SourceCapabilities.supports_incremental` exists as the extension point;
-no connector implements it yet.
+after a retry, and (hardening pass) an explicit continuation run can
+resume a *new* run from a prior run's cursor after a
+`PageLimitExceededError` (`trigger_manual_run(..., continue_from=...)` --
+see [ADR 0005](decisions/0005-execution-orchestration.md)). Neither of
+those is an incremental watermark: a plain fresh manual trigger still
+starts from `start_page`/the beginning, and there is still no mechanism
+for "only fetch policies updated since the last *successful* run"
+independent of a page-limit failure. `SourceCapabilities.supports_incremental`
+exists as the extension point; no connector implements it yet.
 
 ## Unrestricted custom SQL
 

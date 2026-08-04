@@ -96,7 +96,8 @@ extracting a source would be a correctness bug, not a graceful
 degradation. `PageLimitExceededError` is always non-retryable: retrying
 immediately with the same `max_pages` hits the identical wall, so
 resolving it is an operator decision (raise the limit, or confirm the
-data genuinely ended) followed by a fresh manual trigger.
+data genuinely ended) followed by an explicit **continuation run**, not
+a plain fresh trigger -- see below.
 
 Because the exception is raised by the connector's generator *after* the
 capped page has already been yielded and processed (raw-stored, mapped,
@@ -109,13 +110,31 @@ unaffected: both stop the generator via a different code path that never
 reaches the `max_pages` check at all, so a real end of data is never
 misreported as truncation.
 
-### Resumable extraction
+### Resumable extraction, within a run and across runs
 
 `PipelineRun.last_successful_cursor` and `pages_extracted` are updated
-after every successfully processed page. A retried attempt resumes
+after every successfully processed page. A retried attempt (the *same*
+run, re-claimed via `self.retry()`) resumes
 `source.fetch(credential, cursor=run.last_successful_cursor)` and
 continues raw-payload sequence numbering from `run.pages_extracted`,
 rather than re-extracting pages that already succeeded.
+
+`PageLimitExceededError` is always non-retryable, so a run that hits it
+never auto-retries this way -- but it is explicitly *continuable* as a
+new run. A plain fresh manual trigger (`trigger_manual_run` with no
+`continue_from`) starts extraction over from the source's configured
+`start_page`, which would duplicate every page the failed run already
+extracted and loaded; that is not what "resuming" a page-limit failure
+means. Instead, `trigger_manual_run(pipeline, ..., continue_from=failed_run)`
+(or `manage.py run_pipeline ... --continue-from <run_id>`) creates a
+*new* `PipelineRun`, pre-seeded with the failed run's
+`last_successful_cursor` and counters and linked to it via
+`continued_from`, so the same resume-from-cursor logic above picks up
+exactly where the failed run stopped. `trigger_manual_run` only allows
+this when `continue_from` is `FAILED` with
+`error_category="PageLimitExceededError"`; any other `continue_from`
+state raises `ConfigurationError` rather than risk seeding a new run from
+an unrelated or non-terminal one.
 
 ### At-least-once, not exactly-once -- the duplicate window is explicit
 
@@ -160,7 +179,9 @@ can't grow a row without limit.
   this platform doesn't rely on for anything beyond triggering retries.
 - Operators can trust that a `SUCCEEDED` run really did process every
   page, and that a `FAILED` run's `error_is_retryable` flag reflects
-  whether retrying (a fresh manual trigger) is worth attempting again.
+  whether a plain fresh manual trigger is worth attempting again --
+  except for `PageLimitExceededError`, which is non-retryable by
+  definition but has its own resume path (`continue_from=`) instead.
 - The stuck-`RUNNING`-after-a-hard-crash gap and the at-least-once load
   semantics are the two biggest known correctness caveats of this
   milestone. Both are documented here and in `docs/architecture.md`

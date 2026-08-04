@@ -99,8 +99,11 @@ class PageLimitExceededError(FetchFailed):
 
     Always non-retryable: retrying immediately hits the exact same wall
     with the exact same configuration. Resolving it requires an operator
-    decision (raise `max_pages`, or confirm the data really did end) and
-    a fresh manual trigger, not an automatic retry."""
+    decision (raise `max_pages`, or confirm the data really did end)
+    followed by an explicit continuation run
+    (`apps.execution.dispatch.trigger_manual_run(..., continue_from=...)`),
+    not an automatic retry and not a plain fresh trigger -- see
+    docs/decisions/0005-execution-orchestration.md."""
 
     def __init__(self, message: str):
         super().__init__(message, retryable=False, category="PageLimitExceededError")
@@ -127,3 +130,17 @@ class RawPayloadAccessDenied(DataLakeError):
 
     def __init__(self, message: str):
         super().__init__(message, retryable=False, category="RawPayloadAccessDenied")
+
+
+class RawPayloadIntegrityError(DataLakeError):
+    """A raw payload object's actual content didn't match what its
+    content-addressed key promised: a `put()` found an existing object
+    under a checksum-derived key whose size doesn't match the bytes being
+    written, or a `get()` downloaded bytes whose recomputed checksum
+    doesn't match the checksum embedded in the key. Since the key is
+    supposed to make this state unreachable (barring a SHA-256 collision
+    or storage-layer corruption), this always indicates real corruption
+    or tampering, not a transient condition -- always non-retryable."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False, category="RawPayloadIntegrityError")

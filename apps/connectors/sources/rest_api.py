@@ -35,6 +35,8 @@ from apps.core.outbound_http import (
     build_client,
     default_timeout,
     guarded_send,
+    resolve_max_response_bytes,
+    resolve_timeout_seconds,
 )
 from apps.core.paths import get_by_path
 
@@ -120,7 +122,12 @@ class RestApiSourceConnector(SourceConnector):
 
     def _client(self) -> httpx.Client:
         base_timeout = default_timeout()
-        read_timeout = self.config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+        # Config may request a lower read timeout than the platform
+        # default, never a higher one than the deployment's hard ceiling
+        # -- see apps.core.outbound_http.resolve_timeout_seconds.
+        read_timeout = resolve_timeout_seconds(
+            self.config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+        )
         timeout = httpx.Timeout(
             connect=base_timeout.connect,
             read=read_timeout,
@@ -130,7 +137,11 @@ class RestApiSourceConnector(SourceConnector):
         return build_client(base_url=self.config["base_url"], timeout=timeout)
 
     def _max_response_bytes(self) -> int:
-        return self.config.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
+        # Same ceiling enforcement for response size -- see
+        # apps.core.outbound_http.resolve_max_response_bytes.
+        return resolve_max_response_bytes(
+            self.config.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
+        )
 
     def _resolve_auth_provider(self) -> AuthProvider | None:
         auth_provider_type = self.config.get("auth_provider_type")

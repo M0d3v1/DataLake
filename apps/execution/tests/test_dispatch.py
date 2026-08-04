@@ -111,3 +111,92 @@ class TriggerManualRunTests(TenantTestCase):
                 trigger_manual_run(
                     pipeline_b, schema_name=self.tenant.schema_name, idempotency_key="shared-key"
                 )
+
+    # --- continuation (item 1: resuming after PageLimitExceededError) -----
+
+    def _make_page_limit_failed_run(self, pipeline: Pipeline) -> PipelineRun:
+        return PipelineRun.objects.create(
+            pipeline=pipeline,
+            idempotency_key=f"failed-{pipeline.id}",
+            status=PipelineRun.Status.FAILED,
+            error_category="PageLimitExceededError",
+            error_is_retryable=False,
+            last_successful_cursor="4",
+            pages_extracted=3,
+            records_extracted=3,
+            records_loaded=3,
+            raw_payload_count=3,
+        )
+
+    def test_continue_from_seeds_cursor_and_counters_on_the_new_run(self):
+        pipeline = self._make_pipeline()
+        failed_run = self._make_page_limit_failed_run(pipeline)
+
+        with patch("apps.execution.dispatch.run_pipeline_task") as mock_task:
+            run, dispatched = trigger_manual_run(
+                pipeline, schema_name=self.tenant.schema_name, continue_from=failed_run
+            )
+
+        self.assertTrue(dispatched)
+        self.assertNotEqual(run.id, failed_run.id)
+        self.assertEqual(run.continued_from_id, failed_run.id)
+        self.assertEqual(run.last_successful_cursor, "4")
+        self.assertEqual(run.pages_extracted, 3)
+        self.assertEqual(run.records_extracted, 3)
+        self.assertEqual(run.records_loaded, 3)
+        self.assertEqual(run.raw_payload_count, 3)
+        mock_task.delay.assert_called_once_with(
+            schema_name=self.tenant.schema_name, run_id=str(run.id)
+        )
+
+    def test_a_plain_fresh_trigger_does_not_carry_over_cursor_state(self):
+        # Regression guard for the exact bug item 1 fixes: without an
+        # explicit continue_from, a new run must start clean, not resume.
+        pipeline = self._make_pipeline()
+        self._make_page_limit_failed_run(pipeline)
+
+        with patch("apps.execution.dispatch.run_pipeline_task"):
+            run, _ = trigger_manual_run(pipeline, schema_name=self.tenant.schema_name)
+
+        self.assertIsNone(run.continued_from_id)
+        self.assertIsNone(run.last_successful_cursor)
+        self.assertEqual(run.pages_extracted, 0)
+
+    def test_continue_from_rejects_a_run_that_did_not_fail_with_page_limit_exceeded(self):
+        pipeline = self._make_pipeline()
+        run_with_other_failure = PipelineRun.objects.create(
+            pipeline=pipeline,
+            idempotency_key="other-failure",
+            status=PipelineRun.Status.FAILED,
+            error_category="FetchFailed",
+        )
+
+        with self.assertRaises(ConfigurationError):
+            trigger_manual_run(
+                pipeline,
+                schema_name=self.tenant.schema_name,
+                continue_from=run_with_other_failure,
+            )
+
+    def test_continue_from_rejects_a_run_that_is_not_terminal(self):
+        pipeline = self._make_pipeline()
+        running_run = PipelineRun.objects.create(
+            pipeline=pipeline,
+            idempotency_key="still-running",
+            status=PipelineRun.Status.RUNNING,
+        )
+
+        with self.assertRaises(ConfigurationError):
+            trigger_manual_run(
+                pipeline, schema_name=self.tenant.schema_name, continue_from=running_run
+            )
+
+    def test_continue_from_rejects_a_run_belonging_to_a_different_pipeline(self):
+        pipeline_a = self._make_pipeline(name="Pipeline A")
+        pipeline_b = self._make_pipeline(name="Pipeline B")
+        failed_run = self._make_page_limit_failed_run(pipeline_a)
+
+        with self.assertRaises(ConfigurationError):
+            trigger_manual_run(
+                pipeline_b, schema_name=self.tenant.schema_name, continue_from=failed_run
+            )

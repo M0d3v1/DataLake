@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 import respx
+from django.test import override_settings
 
 from apps.connectors.sources.rest_api import RestApiSourceConnector
 from apps.core.exceptions import (
@@ -381,3 +382,30 @@ def test_rejects_non_positive_timeout():
 def test_requires_base_url():
     with pytest.raises(ConfigurationError):
         list(RestApiSourceConnector({"path": "/v1/policies"}).fetch(credential={}))
+
+
+# --- item 3: deployment-level hard ceilings -----------------------------
+
+
+@override_settings(OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS=15)
+def test_client_read_timeout_is_clamped_to_the_deployment_ceiling():
+    connector = _connector(timeout_seconds=9999)
+    with connector._client() as client:
+        assert client.timeout.read == 15
+
+
+def test_client_read_timeout_below_the_ceiling_is_used_as_requested():
+    connector = _connector(timeout_seconds=5)
+    with connector._client() as client:
+        assert client.timeout.read == 5
+
+
+@override_settings(OUTBOUND_HTTP_MAX_RESPONSE_BYTES=1000)
+def test_max_response_bytes_is_clamped_to_the_deployment_ceiling():
+    connector = _connector(max_response_bytes=10_000_000)
+    assert connector._max_response_bytes() == 1000
+
+
+def test_max_response_bytes_below_the_ceiling_is_used_as_requested():
+    connector = _connector(max_response_bytes=500)
+    assert connector._max_response_bytes() == 500

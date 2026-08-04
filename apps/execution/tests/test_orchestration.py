@@ -271,7 +271,12 @@ class FailureHandlingTests(OrchestrationTestCase):
         self.assertEqual(run.records_loaded, 3)
         self.assertEqual(run.raw_payload_count, 3)
         # page 3 wasn't the terminal page, so the cursor points at what
-        # would have come next -- resuming a fresh run continues from here.
+        # would have come next. A *plain* fresh manual trigger does NOT
+        # resume from here -- it starts over at start_page and would
+        # duplicate pages 1-3. Only an explicit continuation run
+        # (apps.execution.dispatch.trigger_manual_run(..., continue_from=run),
+        # see apps/execution/tests/test_dispatch.py) resumes from this
+        # cursor.
         self.assertEqual(run.last_successful_cursor, "4")
         self.assertEqual(RawPayloadRecord.objects.filter(run=run).count(), 3)
         for seq in (1, 2, 3):

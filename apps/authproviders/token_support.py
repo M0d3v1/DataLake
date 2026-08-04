@@ -19,13 +19,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from django.conf import settings
 
 from apps.authproviders.base import AuthProvider
 from apps.core.exceptions import AuthenticationError, ConfigurationError
+from apps.core.outbound_http import DEFAULT_MAX_TIMEOUT_SECONDS
 from apps.core.paths import get_by_path
 
 DEFAULT_TIMEOUT_SECONDS = 30
-MAX_TIMEOUT_SECONDS = 120
 MAX_MULTI_STEPS = 5
 _ALLOWED_METHODS = {"GET", "POST"}
 _EXPIRY_SAFETY_MARGIN_SECONDS = 30
@@ -84,10 +85,17 @@ def validate_field_path(value: Any, *, label: str) -> str:
 
 
 def validate_timeout(value: Any, *, label: str) -> float:
+    # Same deployment-wide ceiling apps.core.outbound_http applies to the
+    # REST source connector -- a connection's config may request a lower
+    # timeout, never one exceeding what the deployment allows for any
+    # outbound call, authentication included.
+    max_timeout_seconds = getattr(
+        settings, "OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS", DEFAULT_MAX_TIMEOUT_SECONDS
+    )
     if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
         raise ConfigurationError(f"{label} must be a positive number")
-    if value > MAX_TIMEOUT_SECONDS:
-        raise ConfigurationError(f"{label} must not exceed {MAX_TIMEOUT_SECONDS} seconds")
+    if value > max_timeout_seconds:
+        raise ConfigurationError(f"{label} must not exceed {max_timeout_seconds} seconds")
     return float(value)
 
 
