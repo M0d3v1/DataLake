@@ -85,6 +85,30 @@ visibility, and the Celery task calls `self.retry()` with bounded
 exponential backoff + jitter (`apps.execution.retry_policy`,
 `MAX_RUN_ATTEMPTS = 5` total tries).
 
+### Pagination never silently truncates
+
+`RestApiSourceConnector.fetch()` enforces a `max_pages` safety cap, but
+reaching it while the source still appears to have more data (the last
+page fetched was neither empty nor short) raises `PageLimitExceededError`
+rather than quietly stopping. A run that hits this is marked `FAILED`,
+never `SUCCEEDED` -- silently reporting success after only partially
+extracting a source would be a correctness bug, not a graceful
+degradation. `PageLimitExceededError` is always non-retryable: retrying
+immediately with the same `max_pages` hits the identical wall, so
+resolving it is an operator decision (raise the limit, or confirm the
+data genuinely ended) followed by a fresh manual trigger.
+
+Because the exception is raised by the connector's generator *after* the
+capped page has already been yielded and processed (raw-stored, mapped,
+loaded, counters saved) by the orchestrator, everything up to and
+including that page survives the failure -- `pages_extracted`,
+`records_extracted`/`records_loaded`, `raw_payload_count`, and
+`last_successful_cursor` all reflect real, already-persisted work, not
+just the pre-failure state. A naturally empty or short final page is
+unaffected: both stop the generator via a different code path that never
+reaches the `max_pages` check at all, so a real end of data is never
+misreported as truncation.
+
 ### Resumable extraction
 
 `PipelineRun.last_successful_cursor` and `pages_extracted` are updated

@@ -10,6 +10,7 @@ from apps.core.exceptions import (
     ConnectionTestFailed,
     FetchFailed,
     MalformedResponseError,
+    PageLimitExceededError,
 )
 
 BASE_URL = "https://api.example-insurer.test"
@@ -76,17 +77,72 @@ def test_fetch_retains_empty_terminal_page_when_configured():
 
 
 @respx.mock
-def test_fetch_respects_max_pages_safety_cap():
+def test_fetch_raises_page_limit_exceeded_when_more_data_may_remain():
     for page in (1, 2, 3):
         respx.get(f"{BASE_URL}/v1/policies", params={"page": str(page)}).mock(
             return_value=httpx.Response(200, json={"results": [{"id": page}]})
         )
     # page 4 deliberately unmocked -- max_pages=3 must stop before requesting it.
 
-    pages = list(_connector(max_pages=3).fetch(credential={}))
+    pages = []
+    with pytest.raises(PageLimitExceededError) as exc_info:
+        for page in _connector(max_pages=3).fetch(credential={}):
+            pages.append(page)
 
+    # the pages up to the limit were still yielded (a caller processes
+    # and persists them) before the connector raises.
     assert len(pages) == 3
     assert [p.records[0]["id"] for p in pages] == [1, 2, 3]
+    assert exc_info.value.retryable is False
+    message = str(exc_info.value)
+    assert "max_pages=3" in message
+    assert "3" in message  # last processed page number, in some form
+
+
+@respx.mock
+def test_fetch_max_pages_error_never_includes_response_body():
+    for page in (1, 2, 3):
+        respx.get(f"{BASE_URL}/v1/policies", params={"page": str(page)}).mock(
+            return_value=httpx.Response(
+                200, json={"results": [{"id": page, "ssn": "secret-body-marker"}]}
+            )
+        )
+
+    with pytest.raises(PageLimitExceededError) as exc_info:
+        list(_connector(max_pages=3).fetch(credential={}))
+
+    assert "secret-body-marker" not in str(exc_info.value)
+
+
+@respx.mock
+def test_fetch_natural_empty_page_termination_does_not_raise_even_near_the_limit():
+    respx.get(f"{BASE_URL}/v1/policies", params={"page": "1"}).mock(
+        return_value=httpx.Response(200, json={"results": [{"id": 1}]})
+    )
+    respx.get(f"{BASE_URL}/v1/policies", params={"page": "2"}).mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+
+    # The limit is only ever checked right after a *non-terminal* page is
+    # yielded; a naturally empty page short-circuits before that check,
+    # even with a tight max_pages, so this must not raise.
+    pages = list(_connector(max_pages=2).fetch(credential={}))
+
+    assert len(pages) == 1
+
+
+@respx.mock
+def test_fetch_short_page_termination_does_not_raise_even_at_the_limit():
+    respx.get(f"{BASE_URL}/v1/policies", params={"page": "1", "page_size": "5"}).mock(
+        return_value=httpx.Response(200, json={"results": [{"id": 1}, {"id": 2}]})
+    )
+
+    # A short page (fewer records than page_size) is a real end of data
+    # even though it's also exactly at max_pages=1 -- must not raise.
+    pages = list(_connector(max_pages=1, page_size=5).fetch(credential={}))
+
+    assert len(pages) == 1
+    assert pages[0].next_cursor is None
 
 
 @respx.mock

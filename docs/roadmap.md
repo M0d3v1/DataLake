@@ -92,3 +92,25 @@ stuck `RUNNING` with no automatic recovery. A staleness reaper (a
 scheduled task that finds runs `RUNNING` past some threshold with a dead
 Celery task and either resets or fails them) is real operational
 work that Milestone 2 does not include.
+
+## Outbound HTTP: IP-pinned connections (close the DNS-rebinding gap)
+
+Noted in [ADR 0006](decisions/0006-outbound-http-security-policy.md):
+`apps.core.outbound_http` resolves and validates a destination's DNS
+once, then hands the hostname (not a pinned IP) to httpx for the actual
+connection -- a narrow DNS-rebinding window between validation and
+connection isn't closed. Fully closing it needs a custom httpx transport
+that connects to the validated IP directly while still presenting the
+original hostname for TLS SNI/certificate validation. This is the
+**recommended next hardening task**: a contained, well-scoped follow-up
+now that the broader SSRF policy (scheme/credential/host/redirect/size
+validation) is in place.
+
+## Outbound HTTP: IP/CIDR-based allowlisting
+
+`AllowedOutboundHost` and the deployment-level setting both match by
+exact hostname string. An operator wanting to approve a whole internal
+subnet (rather than naming each host) currently can't -- this is a
+deliberately conservative starting point (see
+[ADR 0006](decisions/0006-outbound-http-security-policy.md)), not a
+long-term limitation, but CIDR-range allowlisting is real, deferred work.

@@ -165,6 +165,16 @@ SECRET_STORE_ENCRYPTION_KEY = env.secret_store_encryption_key
 SECRET_STORE_BACKEND = "apps.secrets.backends.encrypted_field.EncryptedFieldSecretStore"
 
 # --------------------------------------------------------------------------
+# Outbound HTTP security policy (apps.core.outbound_http). Every request
+# this platform makes to a tenant-configured URL -- REST source requests,
+# token-endpoint/multi-step authentication, connection tests -- goes
+# through this policy. See docs/decisions/0006-outbound-http-security-policy.md.
+# --------------------------------------------------------------------------
+OUTBOUND_HTTP_ALLOWED_PRIVATE_HOSTS = env.outbound_http_allowed_private_hosts_list()
+OUTBOUND_HTTP_ALLOW_INSECURE_HTTP = env.outbound_http_allow_insecure_http
+OUTBOUND_HTTP_MAX_RESPONSE_BYTES = env.outbound_http_max_response_bytes
+
+# --------------------------------------------------------------------------
 # Structured logging. Django's own framework logs go through the plain
 # stdlib console handler below; application/domain code should instead use
 # `apps.core.logging.get_logger()`, which is configured (in

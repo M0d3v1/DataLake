@@ -19,27 +19,34 @@ def store_raw_payload(
 ) -> RawPayloadRecord:
     """Persist one extract page/batch as an immutable raw payload and
     record its metadata. `sequence` is the page/batch order within the
-    run, used both for a deterministic storage key and as the natural
-    unique key for this run's pages.
+    run; the storage key also includes a checksum of `data`, so payload
+    *identity* is content-addressed, not just position-addressed.
 
-    Idempotent by design: the storage key is deterministic
-    (`{pipeline}/{run}/{sequence}.raw`), so re-uploading on a retried page
-    just overwrites the same object, and the metadata row is
-    `update_or_create`d on `(run, sequence)` rather than always inserted
-    -- a retried page updates its existing record instead of colliding
-    with the unique constraint or creating a duplicate.
+    Idempotent by construction, not by best-effort overwrite: a retried
+    page with byte-identical content hashes to the same key, so the
+    store backend's own non-overwrite check makes the write a no-op, and
+    `get_or_create` here finds the existing `(run, sequence, checksum)`
+    row rather than inserting a duplicate. A retried page with
+    *different* bytes (the source changed between attempts) hashes to a
+    different key and gets a genuinely new row -- both versions are kept
+    side by side rather than one silently replacing the other. See
+    docs/decisions/0007-raw-payload-immutability.md.
+
+    The tenant boundary is enforced by the store backend itself (it
+    prepends the active tenant's schema to whatever key it's given), not
+    by this function -- see `apps.rawstore.base.RawPayloadStore`.
     """
     checksum = hashlib.sha256(data).hexdigest()
-    key = f"{run.pipeline_id}/{run.id}/{sequence:06d}.raw"
+    key = f"{run.pipeline_id}/{run.id}/{sequence:06d}-{checksum}.raw"
     uri = get_raw_payload_store().put(key, data, content_type=content_type)
-    record, _created = RawPayloadRecord.objects.update_or_create(
+    record, _created = RawPayloadRecord.objects.get_or_create(
         run=run,
         sequence=sequence,
+        checksum_sha256=checksum,
         defaults={
             "storage_uri": uri,
             "content_type": content_type,
             "size_bytes": len(data),
-            "checksum_sha256": checksum,
             "cursor_used": cursor_used,
             "next_cursor": next_cursor,
             "item_count": item_count,

@@ -44,8 +44,24 @@ class Env(BaseSettings):
         default="B4Q8yYib3-h1P8m5S5r2G8f5s0d0f5g6h7j8k9l0m1o="
     )
 
+    # --- Outbound HTTP security policy (apps.core.outbound_http) ---------
+    # Deployment-wide allowlist of hosts the outbound policy may reach
+    # even though they resolve to a private/loopback/link-local address
+    # -- e.g. an internal enterprise system every tenant on this
+    # deployment is allowed to integrate with. Comma-separated hostnames.
+    # Tenant-specific approvals go through apps.connections.models.AllowedOutboundHost
+    # instead. See docs/decisions/0006-outbound-http-security-policy.md.
+    outbound_http_allowed_private_hosts: str = Field(default="")
+    # Plain http:// is refused by default; set True only for deployments
+    # that knowingly need it (e.g. an isolated test/internal network).
+    outbound_http_allow_insecure_http: bool = Field(default=False)
+    outbound_http_max_response_bytes: int = Field(default=10 * 1024 * 1024)
+
     def allowed_hosts_list(self) -> list[str]:
         return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()]
+
+    def outbound_http_allowed_private_hosts_list(self) -> list[str]:
+        return [h.strip() for h in self.outbound_http_allowed_private_hosts.split(",") if h.strip()]
 
 
 env = Env()

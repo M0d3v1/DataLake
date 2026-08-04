@@ -12,6 +12,7 @@ configuration error, not a silently-ignored literal string sent to a real
 endpoint.
 """
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -130,7 +131,7 @@ def substitute_placeholders(value: Any, context: dict[str, dict[str, Any]]) -> A
 # --- extraction -----------------------------------------------------------
 
 
-def extract_value(response: httpx.Response, extract: dict[str, Any]) -> str:
+def extract_value(response: httpx.Response, body: bytes, extract: dict[str, Any]) -> str:
     if extract["from"] == "header":
         header_name = extract["header"]
         value = response.headers.get(header_name)
@@ -139,7 +140,7 @@ def extract_value(response: httpx.Response, extract: dict[str, Any]) -> str:
         return value
 
     try:
-        data = response.json()
+        data = json.loads(body)
     except ValueError as exc:
         raise AuthenticationError("authentication response was not valid JSON") from exc
     field = extract["field"]
@@ -149,7 +150,7 @@ def extract_value(response: httpx.Response, extract: dict[str, Any]) -> str:
     return str(value)
 
 
-def extract_expires_at(response: httpx.Response, expires_in_field: str | None) -> float | None:
+def extract_expires_at(body: bytes, expires_in_field: str | None) -> float | None:
     """Best-effort: a token with no readable expiry is treated as
     long-lived (cached until `invalidate()` is called), not an error --
     expiry is an optional refinement, not something every token endpoint
@@ -157,7 +158,7 @@ def extract_expires_at(response: httpx.Response, expires_in_field: str | None) -
     if not expires_in_field:
         return None
     try:
-        data = response.json()
+        data = json.loads(body)
     except ValueError:
         return None
     value, found = get_by_path(data, expires_in_field)

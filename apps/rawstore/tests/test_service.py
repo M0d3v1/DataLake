@@ -43,7 +43,28 @@ class StoreRawPayloadTests(TenantTestCase):
         self.assertEqual(record.sequence, 1)
         self.assertEqual(record.checksum_sha256, hashlib.sha256(payload).hexdigest())
 
-    def test_retried_page_updates_instead_of_duplicating(self):
+    def test_identical_retry_reuses_the_existing_object_and_row(self):
+        run = self._make_run()
+        fake_store = MagicMock()
+        fake_store.put.return_value = "s3://bucket/key"
+
+        with patch("apps.rawstore.service.get_raw_payload_store", return_value=fake_store):
+            first = store_raw_payload(
+                run, sequence=1, data=b"identical-bytes", content_type="application/json"
+            )
+            second = store_raw_payload(
+                run, sequence=1, data=b"identical-bytes", content_type="application/json"
+            )
+
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(RawPayloadRecord.objects.filter(run=run, sequence=1).count(), 1)
+        # the backend was asked to store the same content-addressed key
+        # both times -- it's the backend's job (checked separately, in
+        # test_s3_backend.py) to make the second call a no-op.
+        first_key, second_key = (call.args[0] for call in fake_store.put.call_args_list)
+        self.assertEqual(first_key, second_key)
+
+    def test_conflicting_retry_preserves_both_versions(self):
         run = self._make_run()
         fake_store = MagicMock()
         fake_store.put.return_value = "s3://bucket/key"
@@ -53,14 +74,19 @@ class StoreRawPayloadTests(TenantTestCase):
                 run, sequence=1, data=b"first-attempt", content_type="application/json"
             )
             second = store_raw_payload(
-                run, sequence=1, data=b"retried-attempt", content_type="application/json"
+                run, sequence=1, data=b"different-attempt", content_type="application/json"
             )
 
-        self.assertEqual(first.id, second.id)
-        self.assertEqual(RawPayloadRecord.objects.filter(run=run, sequence=1).count(), 1)
-        self.assertEqual(second.checksum_sha256, hashlib.sha256(b"retried-attempt").hexdigest())
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(RawPayloadRecord.objects.filter(run=run, sequence=1).count(), 2)
+        self.assertEqual(first.checksum_sha256, hashlib.sha256(b"first-attempt").hexdigest())
+        self.assertEqual(second.checksum_sha256, hashlib.sha256(b"different-attempt").hexdigest())
+        # both point at distinct, content-addressed keys -- neither
+        # storage call could have overwritten the other's object.
+        first_key, second_key = (call.args[0] for call in fake_store.put.call_args_list)
+        self.assertNotEqual(first_key, second_key)
 
-    def test_storage_key_is_deterministic(self):
+    def test_storage_key_is_content_addressed(self):
         run = self._make_run()
         fake_store = MagicMock()
         fake_store.put.return_value = "s3://bucket/key"
@@ -69,7 +95,18 @@ class StoreRawPayloadTests(TenantTestCase):
             store_raw_payload(run, sequence=3, data=b"x", content_type="application/json")
 
         key = fake_store.put.call_args[0][0]
-        self.assertEqual(key, f"{run.pipeline_id}/{run.id}/000003.raw")
+        checksum = hashlib.sha256(b"x").hexdigest()
+        self.assertEqual(key, f"{run.pipeline_id}/{run.id}/000003-{checksum}.raw")
+
+    def test_loaded_successfully_defaults_to_false(self):
+        run = self._make_run()
+        fake_store = MagicMock()
+        fake_store.put.return_value = "s3://bucket/key"
+
+        with patch("apps.rawstore.service.get_raw_payload_store", return_value=fake_store):
+            record = store_raw_payload(run, sequence=1, data=b"x", content_type="application/json")
+
+        self.assertFalse(record.loaded_successfully)
 
     def test_persists_extended_extract_metadata(self):
         run = self._make_run()

@@ -14,8 +14,15 @@ cp .env.example .env
 docker compose build
 docker compose up -d postgres rabbitmq minio
 docker compose run --rm web python manage.py migrate_schemas --shared
+docker compose run --rm web python manage.py provision_raw_store
 docker compose up
 ```
+
+`provision_raw_store` creates the raw-payload bucket if it doesn't exist
+yet. This is a deliberate, explicit, one-time step -- the platform never
+creates storage infrastructure as a side effect of a normal pipeline run
+writing a payload. See
+[ADR 0007](decisions/0007-raw-payload-immutability.md).
 
 This starts:
 

@@ -4,11 +4,16 @@ DataLake is a modular-monolith data integration platform for insurance/insurtech
 connect external REST APIs and databases, store what they return immutably,
 load it into a destination database, and do all of that on a schedule with a
 visible execution history. Milestone 1 built the architectural foundation
-(interfaces, models, multi-tenancy). Milestone 2 makes the platform
+(interfaces, models, multi-tenancy). Milestone 2 made the platform
 actually run pipelines end to end: a real extract -> raw-store -> map ->
 load flow with retries, resumable extraction, and duplicate-dispatch
-protection. This document reflects the current (M2) state and notes
-what's deliberately still deferred.
+protection. A subsequent correctness/security hardening pass closed three
+release blockers: pagination that could silently truncate a run instead
+of failing it, raw payload storage that could overwrite itself on a
+conflicting retry, and outbound HTTP requests with no SSRF protection
+(see [ADR 0006](decisions/0006-outbound-http-security-policy.md) and
+[ADR 0007](decisions/0007-raw-payload-immutability.md)). This document
+reflects the current state and notes what's deliberately still deferred.
 
 ## Process topology
 
@@ -48,7 +53,7 @@ internals.
 | `secrets` | `SecretStore` interface + default encrypted-field backend |
 | `authproviders` | `AuthProvider` interface + built-in providers (API key, Basic, Bearer, token-endpoint, multi-step) |
 | `connectors` | `SourceConnector` / `DestinationConnector` interfaces + registry + built-in connectors (REST API source, SQL Server destination) |
-| `connections` | `Connection` (which connector + config) and `Credential` (which auth provider + secret ref) |
+| `connections` | `Connection` (which connector + config), `Credential` (which auth provider + secret ref), `AllowedOutboundHost` (tenant-level outbound policy allowlist) |
 | `pipelines` | `Pipeline` (source, destination, mapping, schedule) + `apps.pipelines.mapping` |
 | `execution` | `PipelineRun`, `TaskExecution`, `apps.execution.orchestration`/`claims`/`dispatch`/`retry_policy`, the Celery task |
 | `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata |
@@ -88,12 +93,16 @@ per-call and never stored on the connector instance.
 
 Built-in: `rest_api` (GET/POST, static params/headers/JSON body, a
 configurable nested records path, page-number pagination with a
-`page_size`-based short-page stop, a hard `max_pages` safety cap, and a
-one-shot re-authenticate-and-retry on a 401/403) and `sqlserver`
-(SQLAlchemy Core + pyodbc, identifier-validated schema+table, reflected
-and column-checked before load, bounded batched inserts in one
+`page_size`-based short-page stop, a hard `max_pages` safety cap that
+*fails* the run rather than silently truncating it once more data may
+exist, and a one-shot re-authenticate-and-retry on a 401/403) and
+`sqlserver` (SQLAlchemy Core + pyodbc, identifier-validated schema+table,
+reflected and column-checked before load, bounded batched inserts in one
 transaction, append-only). PostgreSQL source/destination, SQL Server
 *source* queries, and upsert/CDC are still deferred -- see the roadmap.
+
+Every outbound request the REST connector makes goes through
+`apps.core.outbound_http` (see below), never through httpx directly.
 
 ## Authentication providers
 
@@ -110,9 +119,29 @@ plain string substitution against a whitelist, never `eval`/`exec`/a
 template engine). Token-based providers cache their acquired token for
 the lifetime of one `SourceConnector.fetch()` call (one pipeline
 execution's extract phase) and re-acquire on expiry or after a source
-401/403 triggers `AuthProvider.invalidate()`. See
-`apps/authproviders/token_support.py` and
+401/403 triggers `AuthProvider.invalidate()`. Every HTTP call a
+token-based provider makes (token-endpoint request, each multi-step
+request) goes through `apps.core.outbound_http`, the same as REST source
+requests. See `apps/authproviders/token_support.py` and
 [ADR 0005](decisions/0005-execution-orchestration.md).
+
+## Outbound HTTP security policy
+
+`apps.core.outbound_http` is the only way this platform reaches a
+tenant-configured URL -- REST source requests, token-endpoint and
+multi-step authentication requests, and connection tests all go through
+`build_client()`/`guarded_send()` here, never bare httpx. It refuses
+non-http(s) schemes, credentials embedded in a URL, and destinations that
+resolve to loopback, link-local (which covers cloud metadata endpoints --
+they all live in the link-local range), multicast, unspecified, or
+private addresses, unless the host is explicitly allowlisted
+(deployment-wide via `settings.OUTBOUND_HTTP_ALLOWED_PRIVATE_HOSTS`, or
+per-tenant via `apps.connections.models.AllowedOutboundHost`). Redirects
+are never followed. Timeouts are bounded on every phase (connect/read/
+write/pool). Response bodies are read under a hard, configurable size
+cap with early abort, never fully buffered first. See
+[ADR 0006](decisions/0006-outbound-http-security-policy.md), including
+the documented DNS-rebinding residual risk this pass doesn't close.
 
 ## Mapping
 
@@ -144,12 +173,16 @@ stuck `RUNNING`; destination loads are at-least-once, not exactly-once).
 second run (and enqueuing a second Celery task) for what should be one
 logical execution. Within a run, `apps.execution.claims.claim_run` uses
 `SELECT ... FOR UPDATE SKIP LOCKED` plus Celery-task-id ownership to stop
-two workers from executing the same run concurrently, and raw-payload
-metadata is `update_or_create`d on `(run, sequence)` so a retried page
-never duplicates its metadata row. What is **not** idempotent: the
-destination load itself (append-only INSERT, at-least-once) -- see
-[ADR 0005](decisions/0005-execution-orchestration.md) for the duplicate
-window this leaves and why it isn't hidden.
+two workers from executing the same run concurrently. Raw-payload storage
+is content-addressed (the object key includes a checksum of the bytes):
+a retried page with identical bytes reuses the same object and the same
+`RawPayloadRecord` row (`get_or_create` on `(run, sequence, checksum)`);
+a retried page with *different* bytes gets a genuinely new object and a
+second row, rather than one silently overwriting the other -- see
+[ADR 0007](decisions/0007-raw-payload-immutability.md). What is **not**
+idempotent: the destination load itself (append-only INSERT,
+at-least-once) -- see [ADR 0005](decisions/0005-execution-orchestration.md)
+for the duplicate window this leaves and why it isn't hidden.
 
 ## Logging
 

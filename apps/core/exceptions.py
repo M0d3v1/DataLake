@@ -88,3 +88,42 @@ class SchemaMismatchError(LoadFailed):
 
     def __init__(self, message: str):
         super().__init__(message, retryable=False, category="SchemaMismatchError")
+
+
+class PageLimitExceededError(FetchFailed):
+    """A source connector reached its configured `max_pages` safety cap
+    while the source still appeared to have more data (the last page
+    fetched was neither empty nor short). Deliberately distinct from a
+    connector simply finishing -- a run that stops here must NOT be
+    reported as having successfully extracted everything.
+
+    Always non-retryable: retrying immediately hits the exact same wall
+    with the exact same configuration. Resolving it requires an operator
+    decision (raise `max_pages`, or confirm the data really did end) and
+    a fresh manual trigger, not an automatic retry."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False, category="PageLimitExceededError")
+
+
+class OutboundRequestBlockedError(DataLakeError):
+    """An outbound HTTP request was refused by the platform's outbound
+    security policy (apps.core.outbound_http): a disallowed scheme,
+    credentials embedded in a URL, a destination resolving to a
+    loopback/link-local/multicast/unspecified/private address that isn't
+    explicitly allowlisted, an oversized response, or a redirect (which
+    the policy never follows). Always non-retryable -- retrying the same
+    request hits the same policy decision."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False, category="OutboundRequestBlockedError")
+
+
+class RawPayloadAccessDenied(DataLakeError):
+    """A raw-payload read was refused: a malformed URI, a bucket other
+    than the configured one, or a tenant prefix that doesn't match the
+    currently active tenant schema. Always non-retryable -- this is an
+    access-control decision, not a transient failure."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False, category="RawPayloadAccessDenied")

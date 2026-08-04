@@ -5,8 +5,13 @@ with authentication applied via the `apps.authproviders` registry. Not a
 general workflow engine: one method, one URL, static params/headers/body,
 one nested records path, page-number pagination only. Cursor-based
 pagination and multi-endpoint workflows are out of scope.
+
+Every outbound request goes through `apps.core.outbound_http` (SSRF
+policy: scheme/host validation, disabled redirects, bounded timeouts and
+response size) -- this connector never talks to httpx directly.
 """
 
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -22,8 +27,15 @@ from apps.core.exceptions import (
     DataLakeError,
     FetchFailed,
     MalformedResponseError,
+    PageLimitExceededError,
 )
 from apps.core.logging import get_logger
+from apps.core.outbound_http import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    build_client,
+    default_timeout,
+    guarded_send,
+)
 from apps.core.paths import get_by_path
 
 log = get_logger(__name__)
@@ -50,12 +62,19 @@ class RestApiSourceConnector(SourceConnector):
         records than this is treated as the last page.
       - start_page (int, default 1)
       - max_pages (int, default 500): hard safety cap on pages per fetch() call.
+        Reaching it while more data may exist raises PageLimitExceededError
+        rather than silently stopping -- see
+        docs/decisions/0005-execution-orchestration.md.
       - retain_empty_terminal_page (bool, default False): store the final
         confirmatory empty page for audit completeness instead of
         silently stopping. Off by default to avoid a wasted request being
         treated as meaningful.
       - auth_provider_type (str, optional): registry key from apps.authproviders.
-      - timeout_seconds (float, default 30)
+      - timeout_seconds (float, default 30): applied as the read timeout;
+        connect/write/pool use the platform's bounded defaults (see
+        apps.core.outbound_http).
+      - max_response_bytes (int, optional): overrides the platform default
+        response-size cap for this connection.
 
     `credential` is passed through to the configured AuthProvider as-is.
     """
@@ -88,11 +107,30 @@ class RestApiSourceConnector(SourceConnector):
         if not isinstance(timeout, int | float) or isinstance(timeout, bool) or timeout <= 0:
             raise ConfigurationError("rest_api source: 'timeout_seconds' must be a positive number")
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(
-            base_url=self.config["base_url"],
-            timeout=self.config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+        max_response_bytes = self.config.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
+        invalid_max_response_bytes = (
+            not isinstance(max_response_bytes, int)
+            or isinstance(max_response_bytes, bool)
+            or max_response_bytes < 1
         )
+        if invalid_max_response_bytes:
+            raise ConfigurationError(
+                "rest_api source: 'max_response_bytes' must be a positive integer"
+            )
+
+    def _client(self) -> httpx.Client:
+        base_timeout = default_timeout()
+        read_timeout = self.config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+        timeout = httpx.Timeout(
+            connect=base_timeout.connect,
+            read=read_timeout,
+            write=base_timeout.write,
+            pool=base_timeout.pool,
+        )
+        return build_client(base_url=self.config["base_url"], timeout=timeout)
+
+    def _max_response_bytes(self) -> int:
+        return self.config.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
 
     def _resolve_auth_provider(self) -> AuthProvider | None:
         auth_provider_type = self.config.get("auth_provider_type")
@@ -127,9 +165,9 @@ class RestApiSourceConnector(SourceConnector):
         provider: AuthProvider | None,
         credential: dict[str, Any],
         page: int,
-    ) -> httpx.Response:
+    ) -> tuple[httpx.Response, bytes]:
         request = self._build_request(client, provider, credential, page)
-        response = self._send(client, request)
+        response, body = self._send(client, request)
 
         if response.status_code in (401, 403) and provider is not None:
             log.warning(
@@ -137,25 +175,25 @@ class RestApiSourceConnector(SourceConnector):
             )
             provider.invalidate(credential or {})
             retry_request = self._build_request(client, provider, credential, page)
-            response = self._send(client, retry_request)
+            response, body = self._send(client, retry_request)
 
         if response.status_code in _RETRYABLE_STATUS_CODES or 500 <= response.status_code < 600:
             raise FetchFailed(f"source returned HTTP {response.status_code}", retryable=True)
         if response.status_code >= 400:
             raise FetchFailed(f"source returned HTTP {response.status_code}", retryable=False)
-        return response
+        return response, body
 
-    def _send(self, client: httpx.Client, request: httpx.Request) -> httpx.Response:
+    def _send(self, client: httpx.Client, request: httpx.Request) -> tuple[httpx.Response, bytes]:
         try:
-            return client.send(request)
+            return guarded_send(client, request, max_response_bytes=self._max_response_bytes())
         except httpx.TimeoutException as exc:
             raise FetchFailed(f"timeout calling source: {exc}", retryable=True) from exc
         except httpx.HTTPError as exc:
             raise FetchFailed(f"network error calling source: {exc}", retryable=True) from exc
 
-    def _parse_json(self, response: httpx.Response) -> Any:
+    def _parse_json(self, body: bytes) -> Any:
         try:
-            return response.json()
+            return json.loads(body)
         except ValueError as exc:
             raise MalformedResponseError(f"source returned invalid JSON: {exc}") from exc
 
@@ -198,8 +236,8 @@ class RestApiSourceConnector(SourceConnector):
         pages_yielded = 0
         with self._client() as client:
             while True:
-                response = self._send_with_auth_retry(client, provider, credential, page)
-                data = self._parse_json(response)
+                response, body = self._send_with_auth_retry(client, provider, credential, page)
+                data = self._parse_json(body)
                 records = self._extract_records(data, records_path)
                 content_type = response.headers.get("content-type", "application/json")
 
@@ -208,7 +246,7 @@ class RestApiSourceConnector(SourceConnector):
                         yield FetchResult(
                             records=[],
                             next_cursor=None,
-                            raw_payload=response.content,
+                            raw_payload=body,
                             raw_content_type=content_type,
                             cursor_used=str(page),
                             source_path=self.config["path"],
@@ -223,7 +261,7 @@ class RestApiSourceConnector(SourceConnector):
                 yield FetchResult(
                     records=records,
                     next_cursor=next_cursor,
-                    raw_payload=response.content,
+                    raw_payload=body,
                     raw_content_type=content_type,
                     cursor_used=str(page),
                     source_path=self.config["path"],
@@ -234,8 +272,17 @@ class RestApiSourceConnector(SourceConnector):
                 if is_last_page:
                     break
                 if pages_yielded >= max_pages:
-                    log.warning(
-                        "rest_api_source.max_pages_reached", max_pages=max_pages, last_page=page
+                    # The page just yielded (and, by now, already stored/
+                    # mapped/loaded by the caller) was a full page with a
+                    # next_cursor -- there is no signal the source is
+                    # actually done. Raising here (rather than the old
+                    # silent break) means the caller must NOT report this
+                    # run as successful; everything already processed up
+                    # to and including this page stays recorded. See
+                    # docs/decisions/0005-execution-orchestration.md.
+                    raise PageLimitExceededError(
+                        f"rest_api source reached max_pages={max_pages} while more data may "
+                        f"remain: last successfully processed page={page}, "
+                        f"next_cursor={next_cursor!r}"
                     )
-                    break
                 page += 1

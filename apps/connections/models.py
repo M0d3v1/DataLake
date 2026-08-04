@@ -72,3 +72,33 @@ class Credential(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"Credential({self.auth_provider_type}) for {self.connection_id}"
+
+
+class AllowedOutboundHost(TimeStampedModel):
+    """Tenant-level override of the outbound HTTP security policy
+    (apps.core.outbound_http): a hostname this organization has
+    explicitly approved to be contacted even though it resolves to a
+    private/loopback/link-local address -- e.g. an internal enterprise
+    system reachable from the worker network. See
+    docs/decisions/0006-outbound-http-security-policy.md.
+
+    Deliberately just a hostname allowlist, not a general firewall
+    config: adding a row here does not disable any other part of the
+    outbound policy (scheme validation, redirect handling, response size
+    limits, ...), it only lifts the private/loopback/link-local block for
+    that one host.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    host = models.CharField(max_length=255, unique=True)
+    reason = models.CharField(max_length=500, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="+"
+    )
+
+    def save(self, *args, **kwargs):
+        self.host = self.host.strip().lower()
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return self.host

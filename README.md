@@ -13,22 +13,40 @@ restricted advanced SQL).
 
 ## Status
 
-**Milestone 2: first working vertical slice.** A fictional authenticated,
-paginated REST API can be configured as a source, its responses are
-stored immutably before mapping, mapped records are loaded into a SQL
-Server destination in bounded batches, and the whole run is manually
-triggerable, retried, and recorded in execution history. See
+**Milestone 2, plus a correctness/security hardening pass.** A fictional
+authenticated, paginated REST API can be configured as a source, its
+responses are stored immutably before mapping, mapped records are loaded
+into a SQL Server destination in bounded batches, and the whole run is
+manually triggerable, retried, and recorded in execution history. See
 [docs/architecture.md](docs/architecture.md) for what's built vs.
 deliberately deferred, [docs/decisions/](docs/decisions/) for the
 reasoning behind the major structural choices, and
 [docs/roadmap.md](docs/roadmap.md) for what's coming next.
 
-**Guarantees, stated plainly:** raw source responses are stored
-immutably and idempotently (a retried page updates its own record, never
-duplicates). Destination loads are **at-least-once, not exactly-once** --
-see [ADR 0005](docs/decisions/0005-execution-orchestration.md) for the
-duplicate-risk window this leaves when a worker crashes between a
-destination commit and the platform recording it.
+**Guarantees, stated plainly:**
+
+- Raw source responses are stored **immutably**: the object key includes
+  a checksum of the bytes and a tenant prefix enforced by the storage
+  backend itself, an object is never overwritten, and a retried page
+  either reuses the identical object (same bytes) or preserves both
+  versions side by side (different bytes) rather than one silently
+  replacing the other. See [ADR 0007](docs/decisions/0007-raw-payload-immutability.md).
+- Destination loads are **at-least-once, not exactly-once** -- see
+  [ADR 0005](docs/decisions/0005-execution-orchestration.md) for the
+  duplicate-risk window this leaves when a worker crashes between a
+  destination commit and the platform recording it.
+- Reaching a source's `max_pages` safety cap while more data may still
+  exist is a **failure**, not a partial success -- the run is marked
+  `FAILED` (`PageLimitExceededError`, never retried automatically), and
+  everything extracted up to that point stays recorded rather than being
+  discarded or silently reported as a complete sync.
+- Every outbound request (REST source, token-endpoint/multi-step
+  authentication, connection tests) goes through a shared security
+  policy that blocks loopback/link-local/cloud-metadata/private/multicast
+  destinations by default, disables redirects, and bounds timeouts and
+  response size -- see [ADR 0006](docs/decisions/0006-outbound-http-security-policy.md)
+  for exactly what it does and doesn't close (a documented, narrow
+  DNS-rebinding gap remains, flagged as the next hardening task).
 
 ### Configuring a source (fictional example)
 
@@ -95,6 +113,7 @@ cp .env.example .env
 docker compose build
 docker compose up -d postgres rabbitmq minio
 docker compose run --rm web python manage.py migrate_schemas --shared
+docker compose run --rm web python manage.py provision_raw_store
 docker compose up
 ```
 
@@ -106,18 +125,20 @@ tests: [docs/setup.md](docs/setup.md).
 ```
 config/            Django project settings, Celery app, URLconf
 apps/
-  core/            Shared base models, exceptions, structured logging
+  core/            Shared base models, exceptions, structured logging,
+                    outbound_http (shared SSRF-hardened HTTP policy)
   orgs/            Organization (tenant), Domain, Membership
   accounts/        Custom User model
   secrets/         SecretStore interface + encrypted-field default backend
   authproviders/   AuthProvider interface + api_key/basic/bearer/token_endpoint/multi_step_token
   connectors/      SourceConnector/DestinationConnector interfaces + registry
                     + built-in REST API source, SQL Server destination
-  connections/      Connection + Credential models
+  connections/      Connection + Credential + AllowedOutboundHost models
   pipelines/       Pipeline model + destination-mapping mapper
   execution/       PipelineRun, TaskExecution, orchestration/claims/dispatch/
                     retry_policy, the Celery task, `run_pipeline` management command
-  rawstore/        RawPayloadStore interface + S3/MinIO backend
+  rawstore/        RawPayloadStore interface + S3/MinIO backend (tenant-scoped,
+                    content-addressed, never-overwrite), `provision_raw_store` command
   auditing/        AuditLog + record_audit_event()
 docs/
   architecture.md  Module boundaries, key abstractions, what's deferred
