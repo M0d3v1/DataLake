@@ -1,0 +1,106 @@
+"""Connector interfaces.
+
+A "connector" is the only place platform code talks to an external
+system. Two flavors:
+
+  - SourceConnector: pulls records (+ the raw payload they came from)
+    from an external API or database.
+  - DestinationConnector: writes records into an external database.
+
+Connectors declare their own capabilities so the orchestration layer
+(apps.execution) can adapt instead of hard-coding per-connector behavior
+-- e.g. falling back to a full refresh when a source doesn't support
+incremental sync, rather than assuming every connector can.
+
+`config` (passed at construction) holds non-secret settings (host, path,
+pagination options, table name, ...). `credential` (passed per call) is
+the *decrypted* secret payload, resolved by the caller via
+`apps.secrets.get_secret_store()` immediately before use and never
+persisted on the connector instance.
+"""
+
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import Any, ClassVar
+
+
+@dataclass(frozen=True)
+class SourceCapabilities:
+    supports_incremental: bool = False
+    supports_pagination: bool = True
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    """One page/batch from a source connector."""
+
+    records: list[dict[str, Any]]
+    next_cursor: str | None
+    raw_payload: bytes
+    raw_content_type: str = "application/json"
+
+
+class SourceConnector(ABC):
+    type_key: ClassVar[str]
+    capabilities: ClassVar[SourceCapabilities] = SourceCapabilities()
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+
+    @abstractmethod
+    def test_connection(self, credential: dict[str, Any]) -> None:
+        """Raise `apps.core.exceptions.ConnectionTestFailed` on failure."""
+
+    @abstractmethod
+    def fetch(
+        self, credential: dict[str, Any], cursor: str | None = None
+    ) -> Iterator[FetchResult]:
+        """Yield one `FetchResult` per page/batch, starting from `cursor`
+        (None means "from the beginning"). Callers persist the last
+        `next_cursor` they saw to support resuming/incremental sync,
+        subject to `capabilities.supports_incremental`."""
+
+
+@dataclass(frozen=True)
+class DestinationMapping:
+    """Where and how fetched records are written at the destination."""
+
+    table_name: str
+    # destination_column -> source_field
+    columns: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DestinationCapabilities:
+    supports_upsert: bool = False
+    supports_guided_schema_creation: bool = False
+
+
+class DestinationConnector(ABC):
+    type_key: ClassVar[str]
+    capabilities: ClassVar[DestinationCapabilities] = DestinationCapabilities()
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+
+    @abstractmethod
+    def test_connection(self, credential: dict[str, Any]) -> None:
+        """Raise `apps.core.exceptions.ConnectionTestFailed` on failure."""
+
+    def ensure_schema(self, credential: dict[str, Any], mapping: DestinationMapping) -> None:
+        """Create or verify the destination table matches `mapping`.
+
+        Default implementation raises NotImplementedError; connectors
+        that support guided schema creation should override this and set
+        `capabilities.supports_guided_schema_creation = True`.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support guided schema creation"
+        )
+
+    @abstractmethod
+    def load(
+        self, credential: dict[str, Any], records: list[dict[str, Any]], *, mode: str = "append"
+    ) -> int:
+        """Write `records` to the destination, return the count written."""
