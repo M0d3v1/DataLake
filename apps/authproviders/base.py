@@ -39,3 +39,12 @@ class AuthProvider(ABC):
         is missing fields this provider requires. Default: no-op; concrete
         providers override to fail fast with a clear message instead of a
         KeyError deep inside `prepare_request`."""
+
+    def invalidate(self, credential: dict[str, Any]) -> None:  # noqa: B027
+        """Discard any cached token/state for `credential`, forcing the
+        next `prepare_request` to re-acquire. Default: no-op (stateless
+        providers like api_key/basic/bearer have nothing to invalidate).
+        Token-based providers override this; callers use it after a
+        source responds 401/403 despite a request that looked
+        authenticated, to force one re-auth-and-retry rather than looping
+        forever on a stale cached token."""
