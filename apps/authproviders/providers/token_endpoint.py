@@ -15,6 +15,7 @@ from apps.authproviders.token_support import (
     validate_url,
 )
 from apps.core.exceptions import AuthenticationError
+from apps.core.outbound_http import build_client, default_timeout, guarded_send
 
 
 @register
@@ -44,27 +45,36 @@ class TokenEndpointAuthProvider(TokenCachingAuthProvider):
     def _acquire(self, credential: dict[str, Any]) -> CachedToken:
         url = validate_url(credential.get("token_url"), label="credential.token_url")
         method = validate_method(credential.get("method", "POST"), label="credential.method")
-        timeout = validate_timeout(
+        read_timeout = validate_timeout(
             credential.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
             label="credential.timeout_seconds",
         )
         extract = validate_extract_config(credential.get("extract"), label="credential.extract")
 
         headers = dict(credential.get("request_headers", {}))
-        body = credential.get("request_body")
-        request_kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout}
-        if method == "POST" and body is not None:
-            request_kwargs["json"] = body
+        request_body = credential.get("request_body")
+        request_kwargs: dict[str, Any] = {"headers": headers}
+        if method == "POST" and request_body is not None:
+            request_kwargs["json"] = request_body
+
+        base_timeout = default_timeout()
+        timeout = httpx.Timeout(
+            connect=base_timeout.connect,
+            read=read_timeout,
+            write=base_timeout.write,
+            pool=base_timeout.pool,
+        )
 
         try:
-            with httpx.Client() as client:
-                response = client.request(method, url, **request_kwargs)
+            with build_client(timeout=timeout) as client:
+                request = client.build_request(method, url, **request_kwargs)
+                response, response_body = guarded_send(client, request)
         except httpx.HTTPError as exc:
             raise AuthenticationError(f"token endpoint request failed: {exc}") from exc
 
         if response.status_code >= 400:
             raise AuthenticationError(f"token endpoint returned HTTP {response.status_code}")
 
-        token_value = extract_value(response, extract)
-        expires_at = extract_expires_at(response, credential.get("expires_in_field"))
+        token_value = extract_value(response, response_body, extract)
+        expires_at = extract_expires_at(response_body, credential.get("expires_in_field"))
         return CachedToken(value=token_value, expires_at=expires_at)

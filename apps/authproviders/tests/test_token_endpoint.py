@@ -1,6 +1,7 @@
 import httpx
 import pytest
 import respx
+from django.test import override_settings
 
 from apps.authproviders.providers.token_endpoint import TokenEndpointAuthProvider
 from apps.core.exceptions import AuthenticationError, ConfigurationError
@@ -130,6 +131,29 @@ def test_rejects_excessive_timeout():
     provider = TokenEndpointAuthProvider()
     with pytest.raises(ConfigurationError):
         provider.prepare_request(_dummy_request(), _credential(timeout_seconds=9999))
+
+
+@override_settings(OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS=30)
+def test_timeout_ceiling_is_deployment_configurable_not_hardcoded():
+    # item 3: authentication calls must respect the same deployment-wide
+    # timeout ceiling as source connections, not a separate hardcoded
+    # constant that ignores settings.OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS.
+    provider = TokenEndpointAuthProvider()
+    with pytest.raises(ConfigurationError, match="30"):
+        provider.prepare_request(_dummy_request(), _credential(timeout_seconds=60))
+
+
+@respx.mock
+@override_settings(OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS=600)
+def test_a_higher_deployment_ceiling_allows_a_previously_rejected_timeout():
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok_abc123"})
+    )
+    provider = TokenEndpointAuthProvider()
+
+    request = provider.prepare_request(_dummy_request(), _credential(timeout_seconds=300))
+
+    assert request.headers["Authorization"] == "Bearer tok_abc123"
 
 
 @respx.mock

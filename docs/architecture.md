@@ -4,11 +4,31 @@ DataLake is a modular-monolith data integration platform for insurance/insurtech
 connect external REST APIs and databases, store what they return immutably,
 load it into a destination database, and do all of that on a schedule with a
 visible execution history. Milestone 1 built the architectural foundation
-(interfaces, models, multi-tenancy). Milestone 2 makes the platform
+(interfaces, models, multi-tenancy). Milestone 2 made the platform
 actually run pipelines end to end: a real extract -> raw-store -> map ->
 load flow with retries, resumable extraction, and duplicate-dispatch
-protection. This document reflects the current (M2) state and notes
-what's deliberately still deferred.
+protection. A subsequent correctness/security hardening pass closed three
+release blockers: pagination that could silently truncate a run instead
+of failing it, raw payload storage that could overwrite itself on a
+conflicting retry, and outbound HTTP requests with no SSRF protection
+(see [ADR 0006](decisions/0006-outbound-http-security-policy.md) and
+[ADR 0007](decisions/0007-raw-payload-immutability.md)). A follow-up
+review-fix pass then closed the remaining gaps found in that hardening
+work: a real cross-run continuation mechanism after
+`PageLimitExceededError` (Milestone 2's own resumption only covered a
+retry of the *same* run), corrected outbound allowlist semantics
+(private-host allowlisting no longer implicitly permits plain HTTP or
+bypasses loopback/link-local/cloud-metadata), deployment-wide hard
+ceilings on response size and timeouts, `trust_env=False` on every HTTP
+client, a stable tenant UUID (not `schema_name`) and atomic create-only
+writes for raw payload storage, a data migration correcting
+`loaded_successfully` on rows that predated that field, redirect-target
+sanitization before logging, and the Django 5.2 LTS upgrade. Most
+recently, a minimal internal operator UI (Django templates + HTMX) made
+two previously shell-only workflows -- raw payload storage migration and
+pipeline-run continuation -- reachable without shell access (see
+[ADR 0008](decisions/0008-internal-operator-ui.md)). This document
+reflects the current state and notes what's deliberately still deferred.
 
 ## Process topology
 
@@ -48,11 +68,12 @@ internals.
 | `secrets` | `SecretStore` interface + default encrypted-field backend |
 | `authproviders` | `AuthProvider` interface + built-in providers (API key, Basic, Bearer, token-endpoint, multi-step) |
 | `connectors` | `SourceConnector` / `DestinationConnector` interfaces + registry + built-in connectors (REST API source, SQL Server destination) |
-| `connections` | `Connection` (which connector + config) and `Credential` (which auth provider + secret ref) |
+| `connections` | `Connection` (which connector + config), `Credential` (which auth provider + secret ref), `AllowedOutboundHost` (tenant-level outbound policy allowlist) |
 | `pipelines` | `Pipeline` (source, destination, mapping, schedule) + `apps.pipelines.mapping` |
 | `execution` | `PipelineRun`, `TaskExecution`, `apps.execution.orchestration`/`claims`/`dispatch`/`retry_policy`, the Celery task |
-| `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata |
+| `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata, `apps.rawstore.migration` (legacy-key migration service) |
 | `auditing` | `AuditLog` + `record_audit_event()` |
+| `opsui` | Internal operator UI: `RawPayloadMigrationJob` (public schema), permissions, views/urls/templates for raw payload migration and pipeline run/continuation -- see [ADR 0008](decisions/0008-internal-operator-ui.md) |
 
 ## Internal vs. external data access
 
@@ -88,12 +109,16 @@ per-call and never stored on the connector instance.
 
 Built-in: `rest_api` (GET/POST, static params/headers/JSON body, a
 configurable nested records path, page-number pagination with a
-`page_size`-based short-page stop, a hard `max_pages` safety cap, and a
-one-shot re-authenticate-and-retry on a 401/403) and `sqlserver`
-(SQLAlchemy Core + pyodbc, identifier-validated schema+table, reflected
-and column-checked before load, bounded batched inserts in one
+`page_size`-based short-page stop, a hard `max_pages` safety cap that
+*fails* the run rather than silently truncating it once more data may
+exist, and a one-shot re-authenticate-and-retry on a 401/403) and
+`sqlserver` (SQLAlchemy Core + pyodbc, identifier-validated schema+table,
+reflected and column-checked before load, bounded batched inserts in one
 transaction, append-only). PostgreSQL source/destination, SQL Server
 *source* queries, and upsert/CDC are still deferred -- see the roadmap.
+
+Every outbound request the REST connector makes goes through
+`apps.core.outbound_http` (see below), never through httpx directly.
 
 ## Authentication providers
 
@@ -110,9 +135,40 @@ plain string substitution against a whitelist, never `eval`/`exec`/a
 template engine). Token-based providers cache their acquired token for
 the lifetime of one `SourceConnector.fetch()` call (one pipeline
 execution's extract phase) and re-acquire on expiry or after a source
-401/403 triggers `AuthProvider.invalidate()`. See
-`apps/authproviders/token_support.py` and
+401/403 triggers `AuthProvider.invalidate()`. Every HTTP call a
+token-based provider makes (token-endpoint request, each multi-step
+request) goes through `apps.core.outbound_http`, the same as REST source
+requests. See `apps/authproviders/token_support.py` and
 [ADR 0005](decisions/0005-execution-orchestration.md).
+
+## Outbound HTTP security policy
+
+`apps.core.outbound_http` is the only way this platform reaches a
+tenant-configured URL -- REST source requests, token-endpoint and
+multi-step authentication requests, and connection tests all go through
+`build_client()`/`guarded_send()` here, never bare httpx. It refuses
+non-http(s) schemes and credentials embedded in a URL; resolves the host
+and refuses destinations that are loopback, link-local (which covers
+cloud metadata endpoints -- they all live in the link-local range),
+multicast, unspecified, or private, unless explicitly allowlisted --
+allowlisting is layered, not one flag: a plain host allowlist
+(deployment-wide `settings.OUTBOUND_HTTP_ALLOWED_PRIVATE_HOSTS`, or
+per-tenant `apps.connections.models.AllowedOutboundHost`) bypasses only
+the "private" category, while the higher-risk categories
+(loopback/link-local/multicast/unspecified) require the separate,
+deployment-only `settings.OUTBOUND_HTTP_ALLOWED_UNSAFE_HOSTS`. Plain
+`http://` requires its own, separate permission
+(`OUTBOUND_HTTP_ALLOW_INSECURE_HTTP` or `OUTBOUND_HTTP_INSECURE_ALLOWED_HOSTS`)
+-- being on a destination allowlist never implies it. Redirects are
+never followed, and a refused redirect's target is sanitized (query
+string/fragment/credentials stripped) before it reaches an error message
+or log line. Timeouts and response size are bounded on every call, at a
+deployment-wide hard ceiling a connection's own config may lower but
+never exceed. `httpx.Client` instances never trust the process
+environment for proxy/netrc configuration (`trust_env=False`) -- proxy
+support, if needed, is explicit and deployment-controlled. See
+[ADR 0006](decisions/0006-outbound-http-security-policy.md), including
+the documented DNS-rebinding residual risk this pass doesn't close.
 
 ## Mapping
 
@@ -132,8 +188,13 @@ resolve the source/destination connectors and credentials, then for each
 page from `source.fetch()`: store the raw payload, map the records, load
 them, and persist updated counters -- in that order, so a page's raw
 payload always exists before (and independent of) whether its load
-succeeds. See [ADR 0005](decisions/0005-execution-orchestration.md) for
-the full claiming/retry/duplicate-risk model, including what's
+succeeds. A run that fails with `PageLimitExceededError` is resumed via
+an explicit continuation run (`apps.execution.dispatch.trigger_manual_run(
+..., continue_from=failed_run)`, or `manage.py run_pipeline
+--continue-from <run_id>`), which seeds the new run's cursor/counters
+from the failed one rather than restarting extraction from `start_page`.
+See [ADR 0005](decisions/0005-execution-orchestration.md) for the full
+claiming/retry/duplicate-risk/continuation model, including what's
 deliberately still a known limitation (a hard-killed worker leaves a run
 stuck `RUNNING`; destination loads are at-least-once, not exactly-once).
 
@@ -144,12 +205,47 @@ stuck `RUNNING`; destination loads are at-least-once, not exactly-once).
 second run (and enqueuing a second Celery task) for what should be one
 logical execution. Within a run, `apps.execution.claims.claim_run` uses
 `SELECT ... FOR UPDATE SKIP LOCKED` plus Celery-task-id ownership to stop
-two workers from executing the same run concurrently, and raw-payload
-metadata is `update_or_create`d on `(run, sequence)` so a retried page
-never duplicates its metadata row. What is **not** idempotent: the
-destination load itself (append-only INSERT, at-least-once) -- see
-[ADR 0005](decisions/0005-execution-orchestration.md) for the duplicate
-window this leaves and why it isn't hidden.
+two workers from executing the same run concurrently. Raw-payload storage
+is content-addressed (the object key includes a checksum of the bytes)
+and tenant-scoped by a stable `Organization.tenant_uuid` (not
+`schema_name`, and not the tenant's sequential integer `id`): a retried
+page with identical bytes reuses the same object -- verified, not just
+assumed, via a size check before treating it as a safe reuse -- and the
+same `RawPayloadRecord` row (`get_or_create` on
+`(run, sequence, checksum)`); a retried page with *different* bytes gets
+a genuinely new object and a second row, rather than one silently
+overwriting the other -- see
+[ADR 0007](decisions/0007-raw-payload-immutability.md), including the
+distinction it draws between this application-level guarantee and a
+storage-level one (e.g. S3 Object Lock), which this codebase doesn't
+configure for you. What is **not**
+idempotent: the destination load itself (append-only INSERT,
+at-least-once) -- see [ADR 0005](decisions/0005-execution-orchestration.md)
+for the duplicate window this leaves and why it isn't hidden.
+
+## Internal operator UI
+
+`apps.opsui` (Django templates + HTMX, no SPA/new frontend framework) is
+the first web UI in this codebase -- everything before it was
+API/service-layer plus CLI management commands. Two url modules, matching
+two audiences that don't share a tenant context: `apps.opsui.urls_public`
+(served via `config/urls_public.py`, `PUBLIC_SCHEMA_URLCONF`) is the
+platform-operator-facing raw payload migration tool, where an
+organization is picked from a server-rendered list; `apps.opsui.urls_tenant`
+(served via `config/urls.py`, `ROOT_URLCONF`) is pipeline run
+listing/detail and the continuation action, reached on each
+organization's own domain with `request.tenant` already resolved by
+`TenantMainMiddleware` -- no URL here ever takes a tenant/schema
+identifier as a parameter. Both call the same application services
+(`apps.rawstore.migration`, `apps.execution.dispatch`) the equivalent
+management commands (`migrate_raw_payload_storage`, `run_pipeline
+--continue-from`) call, so the UI and the CLI can never drift apart.
+Long-running work (the migration job) runs in a Celery task tracked by
+`RawPayloadMigrationJob`, polled from the browser via HTMX, never inline
+in the request/response cycle. See
+[ADR 0008](decisions/0008-internal-operator-ui.md) for the full design,
+including why the job model lives in the public schema and how retry
+safety follows directly from the migration service's own idempotency.
 
 ## Logging
 
@@ -173,8 +269,10 @@ See `docs/roadmap.md` for the full list with rationale. In short:
 scheduling (Celery beat actually triggering runs), PostgreSQL
 source/destination connectors, SQL Server *source* queries, guided
 destination table/index/relationship design, upsert/CDC and incremental
-watermarks across runs, unrestricted custom SQL, a normal-user web UI,
-production secret-manager integration, and analytics dashboards.
-Restricted advanced SQL execution in particular is deliberately deferred
-pending its own design review -- it's the highest-risk feature in the
-product (see the Milestone 1 design proposal's risk list).
+watermarks across runs, unrestricted custom SQL, a self-service
+normal-user web UI (configuring connections/pipelines -- distinct from
+the internal operator UI, which now exists), production secret-manager
+integration, and analytics dashboards. Restricted advanced SQL execution
+in particular is deliberately deferred pending its own design review --
+it's the highest-risk feature in the product (see the Milestone 1 design
+proposal's risk list).

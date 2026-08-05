@@ -188,15 +188,22 @@ class SuccessFlowTests(OrchestrationTestCase):
         self.assertEqual(RawPayloadRecord.objects.filter(run=run).count(), 0)
 
     @respx.mock
-    def test_max_pages_protection_stops_run_successfully(self):
-        for page in (1, 2, 3):
-            respx.get(f"{BASE_URL}/v1/policies", params={"page": str(page)}).mock(
-                return_value=httpx.Response(
-                    200, json={"results": [{"id": f"P-{page}", "premium": 1}]}
-                )
+    def test_max_pages_boundary_succeeds_when_the_capped_page_is_also_the_last_page(self):
+        # max_pages happens to equal the true number of pages -- the
+        # final page is short (a real end of data), so this must succeed,
+        # not be treated as a truncation. Distinguishes "the cap and the
+        # natural end coincide" from "the cap cut off real data" (see
+        # FailureHandlingTests.test_page_limit_exceeded_fails_run_and_preserves_prior_progress).
+        respx.get(f"{BASE_URL}/v1/policies", params={"page": "1", "page_size": "2"}).mock(
+            return_value=httpx.Response(
+                200, json={"results": [{"id": "P-1", "premium": 1}, {"id": "P-2", "premium": 1}]}
             )
+        )
+        respx.get(f"{BASE_URL}/v1/policies", params={"page": "2", "page_size": "2"}).mock(
+            return_value=httpx.Response(200, json={"results": [{"id": "P-3", "premium": 1}]})
+        )
 
-        pipeline = self._make_pipeline(source_config_overrides={"max_pages": 2})
+        pipeline = self._make_pipeline(source_config_overrides={"max_pages": 2, "page_size": 2})
         run = self._make_run(pipeline)
 
         with patch.object(SqlServerDestinationConnector, "load", return_value=1):
@@ -233,6 +240,47 @@ class FailureHandlingTests(OrchestrationTestCase):
         self.assertEqual(run.error_is_retryable, False)
         # the page was already extracted and stored before load() ran
         self.assertTrue(RawPayloadRecord.objects.filter(run=run, sequence=1).exists())
+
+    @respx.mock
+    def test_page_limit_exceeded_fails_run_and_preserves_prior_progress(self):
+        for page in (1, 2, 3):
+            respx.get(f"{BASE_URL}/v1/policies", params={"page": str(page)}).mock(
+                return_value=httpx.Response(
+                    200, json={"results": [{"id": f"P-{page}", "premium": 100}]}
+                )
+            )
+        # page 4 deliberately unmocked -- max_pages=3 must stop before it.
+
+        pipeline = self._make_pipeline(source_config_overrides={"max_pages": 3})
+        run = self._make_run(pipeline)
+
+        from apps.core.exceptions import PageLimitExceededError
+
+        with patch.object(SqlServerDestinationConnector, "load", return_value=1):
+            with self.assertRaises(PageLimitExceededError):
+                run_pipeline(run_id=str(run.id), celery_task_id="task-1", is_final_attempt=True)
+
+        run.refresh_from_db()
+        # never SUCCEEDED -- this is the core guarantee of this fix
+        self.assertEqual(run.status, PipelineRun.Status.FAILED)
+        self.assertEqual(run.error_category, "PageLimitExceededError")
+        self.assertEqual(run.error_is_retryable, False)
+        # everything processed before the limit was hit survives
+        self.assertEqual(run.pages_extracted, 3)
+        self.assertEqual(run.records_extracted, 3)
+        self.assertEqual(run.records_loaded, 3)
+        self.assertEqual(run.raw_payload_count, 3)
+        # page 3 wasn't the terminal page, so the cursor points at what
+        # would have come next. A *plain* fresh manual trigger does NOT
+        # resume from here -- it starts over at start_page and would
+        # duplicate pages 1-3. Only an explicit continuation run
+        # (apps.execution.dispatch.trigger_manual_run(..., continue_from=run),
+        # see apps/execution/tests/test_dispatch.py) resumes from this
+        # cursor.
+        self.assertEqual(run.last_successful_cursor, "4")
+        self.assertEqual(RawPayloadRecord.objects.filter(run=run).count(), 3)
+        for seq in (1, 2, 3):
+            self.assertTrue(RawPayloadRecord.objects.filter(run=run, sequence=seq).exists())
 
     @respx.mock
     def test_malformed_source_json_fails_run_non_retryably(self):

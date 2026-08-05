@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
 from django_tenants.models import DomainMixin, TenantMixin
@@ -15,6 +17,14 @@ class Organization(TenantMixin, TimeStampedModel):
 
     name = models.CharField(max_length=255)
     slug = models.SlugField(unique=True)
+    # A stable, non-guessable tenant identifier for contexts where
+    # `schema_name` (a human-chosen string) or the auto-incrementing `id`
+    # (small, sequential, easy to enumerate) is the wrong thing to use --
+    # e.g. raw payload object-storage key prefixes, where the key should
+    # not double as a predictable enumeration of every tenant on the
+    # deployment. See apps.rawstore.backends.s3.S3RawPayloadStore and
+    # docs/decisions/0007-raw-payload-immutability.md.
+    tenant_uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
 
     # django-tenants: automatically create/migrate the Postgres schema
     # when an Organization is saved. Schema deletion is NOT automatic

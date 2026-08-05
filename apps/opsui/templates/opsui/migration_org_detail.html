@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Raw payload migration &middot; {{ organization.name }}{% endblock %}
+{% block content %}
+<p><a href="{% url 'opsui:org_list' %}">&larr; organizations</a></p>
+<h1>Raw payload migration &middot; {{ organization.name }}</h1>
+<p class="muted">
+    Moves raw payload objects from a legacy (unprefixed, or schema-name
+    prefixed) storage key to the current tenant-UUID-prefixed key.
+    Legacy objects are never deleted automatically -- cleaning them up is
+    a separate, explicitly-controlled operation.
+</p>
+
+{% if job %}
+<div class="card">
+    <h2>Most recent job</h2>
+    <p>
+        <span class="badge badge-{{ job.status }}">{{ job.get_status_display }}</span>
+        &middot; {% if job.dry_run %}dry-run{% else %}migration{% endif %}
+        &middot; started {{ job.started_at|default:"not yet" }}
+    </p>
+    <a class="btn secondary" href="{% url 'opsui:migration_job_detail' job_id=job.id %}">View job</a>
+</div>
+{% endif %}
+
+{% if can_operate %}
+<div class="card">
+    <h2>Start a new job</h2>
+    {% if job and not job.is_terminal %}
+        <p class="warning">An active job is already running for this organization. Only one job may be active per organization at a time.</p>
+    {% else %}
+        <form method="post" action="{% url 'opsui:migration_start' org_id=organization.id %}">
+            {% csrf_token %}
+            <input type="hidden" name="mode" value="dry_run">
+            <button class="btn secondary" type="submit">Run dry-run inspection</button>
+        </form>
+        <form method="post" action="{% url 'opsui:migration_start' org_id=organization.id %}" style="margin-top:0.5rem;"
+              onsubmit="return confirm('This will migrate legacy raw payload objects for {{ organization.name|escapejs }}. Continue?');">
+            {% csrf_token %}
+            <input type="hidden" name="mode" value="real">
+            <button class="btn" type="submit">Start real migration</button>
+        </form>
+    {% endif %}
+</div>
+{% else %}
+<div class="warning">Only platform operators may start a migration job. You can inspect status here.</div>
+{% endif %}
+{% endblock %}

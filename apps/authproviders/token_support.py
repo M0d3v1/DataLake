@@ -12,19 +12,21 @@ configuration error, not a silently-ignored literal string sent to a real
 endpoint.
 """
 
+import json
 import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from django.conf import settings
 
 from apps.authproviders.base import AuthProvider
 from apps.core.exceptions import AuthenticationError, ConfigurationError
+from apps.core.outbound_http import DEFAULT_MAX_TIMEOUT_SECONDS
 from apps.core.paths import get_by_path
 
 DEFAULT_TIMEOUT_SECONDS = 30
-MAX_TIMEOUT_SECONDS = 120
 MAX_MULTI_STEPS = 5
 _ALLOWED_METHODS = {"GET", "POST"}
 _EXPIRY_SAFETY_MARGIN_SECONDS = 30
@@ -83,10 +85,17 @@ def validate_field_path(value: Any, *, label: str) -> str:
 
 
 def validate_timeout(value: Any, *, label: str) -> float:
+    # Same deployment-wide ceiling apps.core.outbound_http applies to the
+    # REST source connector -- a connection's config may request a lower
+    # timeout, never one exceeding what the deployment allows for any
+    # outbound call, authentication included.
+    max_timeout_seconds = getattr(
+        settings, "OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS", DEFAULT_MAX_TIMEOUT_SECONDS
+    )
     if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
         raise ConfigurationError(f"{label} must be a positive number")
-    if value > MAX_TIMEOUT_SECONDS:
-        raise ConfigurationError(f"{label} must not exceed {MAX_TIMEOUT_SECONDS} seconds")
+    if value > max_timeout_seconds:
+        raise ConfigurationError(f"{label} must not exceed {max_timeout_seconds} seconds")
     return float(value)
 
 
@@ -130,7 +139,7 @@ def substitute_placeholders(value: Any, context: dict[str, dict[str, Any]]) -> A
 # --- extraction -----------------------------------------------------------
 
 
-def extract_value(response: httpx.Response, extract: dict[str, Any]) -> str:
+def extract_value(response: httpx.Response, body: bytes, extract: dict[str, Any]) -> str:
     if extract["from"] == "header":
         header_name = extract["header"]
         value = response.headers.get(header_name)
@@ -139,7 +148,7 @@ def extract_value(response: httpx.Response, extract: dict[str, Any]) -> str:
         return value
 
     try:
-        data = response.json()
+        data = json.loads(body)
     except ValueError as exc:
         raise AuthenticationError("authentication response was not valid JSON") from exc
     field = extract["field"]
@@ -149,7 +158,7 @@ def extract_value(response: httpx.Response, extract: dict[str, Any]) -> str:
     return str(value)
 
 
-def extract_expires_at(response: httpx.Response, expires_in_field: str | None) -> float | None:
+def extract_expires_at(body: bytes, expires_in_field: str | None) -> float | None:
     """Best-effort: a token with no readable expiry is treated as
     long-lived (cached until `invalidate()` is called), not an error --
     expiry is an optional refinement, not something every token endpoint
@@ -157,7 +166,7 @@ def extract_expires_at(response: httpx.Response, expires_in_field: str | None) -
     if not expires_in_field:
         return None
     try:
-        data = response.json()
+        data = json.loads(body)
     except ValueError:
         return None
     value, found = get_by_path(data, expires_in_field)

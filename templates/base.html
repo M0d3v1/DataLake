@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}DataLake operator console{% endblock %}</title>
+    {# Pulled from a CDN for local/dev simplicity. A production deployment
+       of this internal tool should vendor htmx.min.js as a static file
+       (a few KB, MIT licensed) with a pinned version + verified SRI hash
+       instead of a runtime CDN dependency. #}
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+        :root { color-scheme: light dark; }
+        body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background: #f4f5f7; color: #1a1d21; }
+        header.topbar { background: #1a1d21; color: #fff; padding: 0.75rem 1.5rem; display: flex; justify-content: space-between; align-items: center; }
+        header.topbar a { color: #fff; text-decoration: none; font-weight: 600; }
+        header.topbar .user { font-size: 0.85rem; opacity: 0.85; }
+        main { max-width: 960px; margin: 1.5rem auto; padding: 0 1rem 3rem; }
+        .card { background: #fff; border: 1px solid #dcdfe4; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.25rem; }
+        h1 { font-size: 1.4rem; } h2 { font-size: 1.15rem; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+        th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #e5e7eb; }
+        .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
+        .badge-pending { background: #e5e7eb; color: #374151; }
+        .badge-running { background: #dbeafe; color: #1e40af; }
+        .badge-succeeded { background: #d1fae5; color: #065f46; }
+        .badge-partially_failed { background: #fef3c7; color: #92400e; }
+        .badge-failed { background: #fee2e2; color: #991b1b; }
+        .badge-cancelled { background: #e5e7eb; color: #374151; }
+        .btn { display: inline-block; padding: 0.45rem 0.9rem; border-radius: 6px; border: 1px solid #1a1d21; background: #1a1d21; color: #fff; font-size: 0.9rem; cursor: pointer; text-decoration: none; }
+        .btn.secondary { background: #fff; color: #1a1d21; }
+        .btn.danger { background: #b91c1c; border-color: #b91c1c; }
+        .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+        .warning { background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 0.75rem 1rem; margin: 0.75rem 0; }
+        .error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 0.75rem 1rem; margin: 0.75rem 0; color: #991b1b; }
+        .messages { list-style: none; padding: 0; }
+        .messages li { padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 0.5rem; background: #eef2ff; }
+        code, pre { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 0.85em; }
+        pre.summary { background: #0b0e14; color: #d1d5db; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+        .muted { color: #6b7280; font-size: 0.85rem; }
+        dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
+        dl.kv dt { color: #6b7280; }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+<header class="topbar">
+    <a href="/ops/">DataLake &middot; operator console</a>
+    <span class="user">
+        {% if request.user.is_authenticated %}
+            {{ request.user.username }}{% if request.user.is_staff %} (platform operator){% endif %}
+            &middot; <a href="{% url 'logout' %}" style="color:#93c5fd;">log out</a>
+        {% else %}
+            <a href="{% url 'login' %}" style="color:#93c5fd;">log in</a>
+        {% endif %}
+    </span>
+</header>
+<main>
+    {% if messages %}
+        <ul class="messages">
+            {% for message in messages %}<li>{{ message }}</li>{% endfor %}
+        </ul>
+    {% endif %}
+    {% block content %}{% endblock %}
+</main>
+</body>
+</html>

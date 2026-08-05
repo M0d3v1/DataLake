@@ -17,6 +17,7 @@ from apps.authproviders.token_support import (
     validate_url,
 )
 from apps.core.exceptions import AuthenticationError, ConfigurationError
+from apps.core.outbound_http import build_client, default_timeout, guarded_send
 
 
 @register
@@ -72,14 +73,21 @@ class MultiStepTokenAuthProvider(TokenCachingAuthProvider):
 
     def _acquire(self, credential: dict[str, Any]) -> CachedToken:
         steps = self._validate_steps(credential)
-        timeout = validate_timeout(
+        read_timeout = validate_timeout(
             credential.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
             label="credential.timeout_seconds",
         )
+        base_timeout = default_timeout()
+        timeout = httpx.Timeout(
+            connect=base_timeout.connect,
+            read=read_timeout,
+            write=base_timeout.write,
+            pool=base_timeout.pool,
+        )
         context: dict[str, dict[str, Any]] = {"credential": credential, "steps": {}}
-        final_response: httpx.Response | None = None
+        final_body: bytes | None = None
 
-        with httpx.Client() as client:
+        with build_client(timeout=timeout) as client:
             for i, step in enumerate(steps):
                 method = validate_method(
                     step.get("method", "POST"), label=f"credential.steps[{i}].method"
@@ -90,12 +98,13 @@ class MultiStepTokenAuthProvider(TokenCachingAuthProvider):
                 if body is not None:
                     body = substitute_placeholders(body, context)
 
-                request_kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout}
+                request_kwargs: dict[str, Any] = {"headers": headers}
                 if method == "POST" and body is not None:
                     request_kwargs["json"] = body
 
                 try:
-                    response = client.request(method, url, **request_kwargs)
+                    request = client.build_request(method, url, **request_kwargs)
+                    response, response_body = guarded_send(client, request)
                 except httpx.HTTPError as exc:
                     raise AuthenticationError(
                         f"multi-step auth step {i} request failed: {exc}"
@@ -107,10 +116,10 @@ class MultiStepTokenAuthProvider(TokenCachingAuthProvider):
                     )
 
                 if "extract" in step:
-                    value = extract_value(response, step["extract"])
+                    value = extract_value(response, response_body, step["extract"])
                     context["steps"][step["extract"]["as"]] = value
 
-                final_response = response
+                final_body = response_body
 
         final_token_from = credential["final_token_from"]
         token_value = context["steps"].get(final_token_from)
@@ -120,8 +129,8 @@ class MultiStepTokenAuthProvider(TokenCachingAuthProvider):
             )
 
         expires_at = (
-            extract_expires_at(final_response, credential.get("expires_in_field"))
-            if final_response is not None
+            extract_expires_at(final_body, credential.get("expires_in_field"))
+            if final_body is not None
             else None
         )
         return CachedToken(value=token_value, expires_at=expires_at)

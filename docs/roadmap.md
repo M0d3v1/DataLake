@@ -50,11 +50,15 @@ express "what changed since X."
 ## Incremental sync watermarks across runs
 
 Milestone 2 resumes a *single* run from its own `last_successful_cursor`
-after a retry. It does not yet carry a watermark *between* separate runs
-(e.g. "only fetch policies updated since the last successful run") --
-every fresh run currently starts from `start_page`/the beginning.
-`SourceCapabilities.supports_incremental` exists as the extension point;
-no connector implements it yet.
+after a retry, and (hardening pass) an explicit continuation run can
+resume a *new* run from a prior run's cursor after a
+`PageLimitExceededError` (`trigger_manual_run(..., continue_from=...)` --
+see [ADR 0005](decisions/0005-execution-orchestration.md)). Neither of
+those is an incremental watermark: a plain fresh manual trigger still
+starts from `start_page`/the beginning, and there is still no mechanism
+for "only fetch policies updated since the last *successful* run"
+independent of a page-limit failure. `SourceCapabilities.supports_incremental`
+exists as the extension point; no connector implements it yet.
 
 ## Unrestricted custom SQL
 
@@ -66,9 +70,17 @@ textbox, per the original Milestone 1 risk assessment.
 
 ## Normal-user web UI
 
-Everything so far is API/service-layer plus one CLI management command.
-The Django templates/HTMX/Alpine UI for configuring connections,
-pipelines, and viewing execution history is unbuilt.
+An **internal operator UI** now exists (Django templates + HTMX, no SPA
+-- see [ADR 0008](decisions/0008-internal-operator-ui.md)): raw payload
+storage migration for platform operators, and pipeline run
+listing/detail/continuation for organization owners/admins/engineers.
+What's still unbuilt is the **normal-user** (self-service, tenant-facing)
+UI: configuring connections, credentials, and pipelines; guided
+destination table creation; browsing full execution history beyond the
+last 50 runs. The operator UI's tenant urlconf
+(`apps.opsui.urls_tenant`, `config/urls.py`) and its
+domain-resolves-the-tenant pattern is the natural foundation to extend
+for that, rather than a separate UI stack.
 
 ## Production secret-manager integration
 
@@ -92,3 +104,25 @@ stuck `RUNNING` with no automatic recovery. A staleness reaper (a
 scheduled task that finds runs `RUNNING` past some threshold with a dead
 Celery task and either resets or fails them) is real operational
 work that Milestone 2 does not include.
+
+## Outbound HTTP: IP-pinned connections (close the DNS-rebinding gap)
+
+Noted in [ADR 0006](decisions/0006-outbound-http-security-policy.md):
+`apps.core.outbound_http` resolves and validates a destination's DNS
+once, then hands the hostname (not a pinned IP) to httpx for the actual
+connection -- a narrow DNS-rebinding window between validation and
+connection isn't closed. Fully closing it needs a custom httpx transport
+that connects to the validated IP directly while still presenting the
+original hostname for TLS SNI/certificate validation. This is the
+**recommended next hardening task**: a contained, well-scoped follow-up
+now that the broader SSRF policy (scheme/credential/host/redirect/size
+validation) is in place.
+
+## Outbound HTTP: IP/CIDR-based allowlisting
+
+`AllowedOutboundHost` and the deployment-level setting both match by
+exact hostname string. An operator wanting to approve a whole internal
+subnet (rather than naming each host) currently can't -- this is a
+deliberately conservative starting point (see
+[ADR 0006](decisions/0006-outbound-http-security-policy.md)), not a
+long-term limitation, but CIDR-range allowlisting is real, deferred work.

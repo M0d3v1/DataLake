@@ -44,8 +44,57 @@ class Env(BaseSettings):
         default="B4Q8yYib3-h1P8m5S5r2G8f5s0d0f5g6h7j8k9l0m1o="
     )
 
+    # --- Outbound HTTP security policy (apps.core.outbound_http) ---------
+    # Deployment-wide allowlist of hosts the outbound policy may reach
+    # even though they resolve to a *private* (RFC1918/ULA/documentation)
+    # address -- e.g. an internal enterprise system every tenant on this
+    # deployment is allowed to integrate with. Comma-separated hostnames.
+    # Tenant-specific approvals go through apps.connections.models.AllowedOutboundHost,
+    # which grants exactly the same "private" bypass and nothing more.
+    # Neither this nor the tenant allowlist ever bypasses loopback,
+    # link-local (cloud metadata), multicast, or unspecified -- see
+    # outbound_http_allowed_unsafe_hosts below. See
+    # docs/decisions/0006-outbound-http-security-policy.md.
+    outbound_http_allowed_private_hosts: str = Field(default="")
+    # Deployment-only allowlist for the categories deliberately excluded
+    # above: loopback, link-local (cloud metadata), multicast, unspecified.
+    # There is no tenant-level equivalent -- a tenant-configured allowlist
+    # entry must never be able to reach the platform's own loopback
+    # interface or a cloud metadata endpoint. Only ever set this for a
+    # deployment that genuinely needs it (e.g. a local sidecar/test
+    # double reachable at 127.0.0.1 in an isolated dev/CI environment).
+    outbound_http_allowed_unsafe_hosts: str = Field(default="")
+    # Plain http:// is refused by default. Being on either allowlist
+    # above does NOT implicitly permit http:// -- that would silently
+    # downgrade transport security for a destination approved only for
+    # its *address*, not its scheme. Set outbound_http_allow_insecure_http
+    # for a deployment-wide exception, or list specific hosts here for a
+    # narrower one (e.g. an isolated internal network without TLS).
+    outbound_http_allow_insecure_http: bool = Field(default=False)
+    outbound_http_insecure_allowed_hosts: str = Field(default="")
+    # Hard deployment ceiling: a connector's own `max_response_bytes`
+    # config may set a *lower* cap, never a higher one. See
+    # apps.core.outbound_http.resolve_max_response_bytes.
+    outbound_http_max_response_bytes: int = Field(default=10 * 1024 * 1024)
+    # Hard deployment ceiling on any single timeout phase (connect/read/
+    # write/pool) a connector's config may request. A connector's
+    # `timeout_seconds` may lower the read timeout, never raise it past
+    # this. See apps.core.outbound_http.resolve_timeout_seconds.
+    outbound_http_max_timeout_seconds: float = Field(default=120.0)
+
     def allowed_hosts_list(self) -> list[str]:
         return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()]
+
+    def outbound_http_allowed_private_hosts_list(self) -> list[str]:
+        return [h.strip() for h in self.outbound_http_allowed_private_hosts.split(",") if h.strip()]
+
+    def outbound_http_allowed_unsafe_hosts_list(self) -> list[str]:
+        return [h.strip() for h in self.outbound_http_allowed_unsafe_hosts.split(",") if h.strip()]
+
+    def outbound_http_insecure_allowed_hosts_list(self) -> list[str]:
+        return [
+            h.strip() for h in self.outbound_http_insecure_allowed_hosts.split(",") if h.strip()
+        ]
 
 
 env = Env()

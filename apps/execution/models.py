@@ -16,6 +16,13 @@ class PipelineRun(TimeStampedModel):
     (`claim_run`, `mark_run_succeeded`, `mark_run_failed`) -- those
     enforce that a terminal run (SUCCEEDED/FAILED) can never move back to
     RUNNING or PENDING. See docs/decisions/0005-execution-orchestration.md.
+
+    `continued_from` links a run to a prior run it explicitly continues
+    (via `apps.execution.dispatch.trigger_manual_run(..., continue_from=...)`)
+    after that prior run failed with `PageLimitExceededError` -- a
+    continuation run is seeded with the prior run's cursor/counters so it
+    resumes extraction rather than re-fetching pages that already
+    succeeded and loaded.
     """
 
     class Status(models.TextChoices):
@@ -35,6 +42,17 @@ class PipelineRun(TimeStampedModel):
     idempotency_key = models.CharField(max_length=255, unique=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    continued_from = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="continuations",
+        help_text=(
+            "Set when this run was explicitly dispatched to continue a prior run that "
+            "failed with PageLimitExceededError -- see apps.execution.dispatch."
+        ),
+    )
 
     # --- execution state (Milestone 2) ------------------------------------
     attempt = models.PositiveIntegerField(

@@ -126,7 +126,7 @@ def _extract_and_load(
     for page in source.fetch(source_credential, cursor=cursor):
         sequence += 1
 
-        store_raw_payload(
+        raw_record = store_raw_payload(
             run,
             sequence=sequence,
             data=page.raw_payload,
@@ -140,6 +140,12 @@ def _extract_and_load(
 
         mapped_records = map_records(page.records, mapping, strict=strict_mapping)
         loaded_count = destination.load(destination_credential, mapped_records, mode="append")
+
+        # Only mark the *version we actually acted on* as loaded -- see
+        # RawPayloadRecord.loaded_successfully and
+        # docs/decisions/0007-raw-payload-immutability.md.
+        raw_record.loaded_successfully = True
+        raw_record.save(update_fields=["loaded_successfully", "updated_at"])
 
         run.pages_extracted = sequence
         run.records_extracted += len(page.records)

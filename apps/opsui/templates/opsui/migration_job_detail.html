@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Migration job {{ job.id }}{% endblock %}
+{% block content %}
+<p><a href="{% url 'opsui:migration_org_detail' org_id=organization.id %}">&larr; {{ organization.name }}</a></p>
+<h1>{% if job.dry_run %}Dry-run inspection{% else %}Raw payload migration{% endif %}</h1>
+<p class="muted">Job <code>{{ job.id }}</code> &middot; {{ organization.name }} &middot; initiated by {{ job.initiated_by|default:"(deleted user)" }}</p>
+
+{% include "opsui/_migration_job_progress.html" %}
+
+{% if job.error_message %}
+<div class="error">
+    <strong>Error:</strong> {{ job.error_message }}
+</div>
+{% endif %}
+
+{% if job.sample_problem_records %}
+<div class="card">
+    <h2>Records needing review ({{ job.sample_problem_records|length }} shown)</h2>
+    <p class="muted">Never shows raw payload contents, object-store credentials, signed URLs, secrets, or tokens -- only safe identifiers.</p>
+    <table>
+        <thead><tr><th>Record</th><th>Run</th><th>Sequence</th><th>Category</th><th>Reason</th></tr></thead>
+        <tbody>
+        {% for entry in job.sample_problem_records %}
+            <tr>
+                <td><code>{{ entry.record_id }}</code></td>
+                <td><code>{{ entry.run_id }}</code></td>
+                <td>{{ entry.sequence }}</td>
+                <td>{{ entry.category }}</td>
+                <td>{{ entry.reason }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+{% if can_operate %}
+<div class="card">
+    <h2>Actions</h2>
+    {% if job.status == "running" or job.status == "pending" %}
+        <form method="post" action="{% url 'opsui:migration_job_cancel' job_id=job.id %}" style="display:inline;">
+            {% csrf_token %}
+            <button class="btn danger" type="submit">Cancel</button>
+        </form>
+    {% endif %}
+    {% if job.is_terminal or job.is_stale %}
+        <form method="post" action="{% url 'opsui:migration_job_retry' job_id=job.id %}" style="display:inline;">
+            {% csrf_token %}
+            <button class="btn secondary" type="submit">
+                {% if job.is_stale %}Retry (job appears stalled){% else %}Retry{% endif %}
+            </button>
+        </form>
+    {% endif %}
+    <a class="btn secondary" href="{% url 'opsui:migration_job_export' job_id=job.id %}">Export summary</a>
+</div>
+{% endif %}
+{% endblock %}
