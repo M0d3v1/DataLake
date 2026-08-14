@@ -6,11 +6,27 @@ not just "not done yet."
 
 ## Scheduling
 
-`Pipeline.schedule_cron` is stored (Milestone 1) but nothing acts on it --
-pipelines only run via manual trigger (`apps.execution.dispatch`,
-`manage.py run_pipeline`). Needs: a Celery-beat-driven reconciliation loop
-that reads active schedules and dispatches runs, using the same
-`trigger_manual_run`-style dedup so a schedule tick never double-dispatches.
+**Built, not yet runtime-verified.** `Pipeline.schedule_cron` now drives
+real scheduling via a self-hosted Airflow instance -- see
+[ADR 0010](decisions/0010-airflow-orchestration.md) -- superseding the
+earlier Celery-beat-driven-reconciliation-loop plan this section used to
+describe. A dynamically generated DAG per active pipeline
+(`dags/pipeline_dag_factory.py`) triggers and observes runs through a new
+internal HTTP API (`apps.orchestration_api`), which itself just calls the
+same `apps.execution.dispatch.trigger_manual_run` the CLI and web UI use
+-- no second implementation of triggering. Airflow runs in its own
+containers with its own metadata database, never importing this
+project's code.
+
+Honestly flagged: the Django side (`apps.orchestration_api`) has 16
+passing tests. The Airflow side (docker-compose services, the DAG
+factory) has been validated for syntax and config correctness
+(`docker compose config`, `ruff check`, a Python compile check) but
+**not run end-to-end** -- there is no Docker daemon available in the
+environment this was built in, so `docker compose up` itself couldn't be
+exercised, let alone a real Airflow scheduler parsing the DAG factory
+and triggering a live run. Treat the Airflow integration as needing a
+first real smoke test before relying on it.
 
 ## Spark-backed transform mode for high-volume pipelines
 

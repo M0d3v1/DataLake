@@ -14,13 +14,14 @@ restricted advanced SQL).
 ## Status
 
 **Milestone 2, a correctness/security hardening pass, a follow-up
-review-fix pass, and a minimal internal operator UI.** A fictional
-authenticated, paginated REST API can be configured as a source, its
-responses are stored immutably before mapping, mapped records are loaded
-into a SQL Server destination in bounded batches, and the whole run is
-manually triggerable, retried, resumed via an explicit continuation
-after a page-limit failure, and recorded in execution history. Runs on
-Django 5.2 LTS. See
+review-fix pass, a minimal internal operator UI, and a self-hosted
+Apache Airflow orchestration layer.** A fictional authenticated,
+paginated REST API can be configured as a source, its responses are
+stored immutably before mapping, mapped records are loaded into a SQL
+Server destination in bounded batches, and the whole run is manually
+triggerable, retried, resumed via an explicit continuation after a
+page-limit failure, scheduled and observed by Airflow, and recorded in
+execution history. Runs on Django 5.2 LTS. See
 [docs/architecture.md](docs/architecture.md) for what's built vs.
 deliberately deferred, [docs/decisions/](docs/decisions/) for the
 reasoning behind the major structural choices, and
@@ -164,13 +165,48 @@ application services (`apps.rawstore.migration`,
 `apps.execution.dispatch`) -- neither duplicates the other's logic, and
 neither is the only supported way to do either workflow.
 
+## Scheduling: Apache Airflow
+
+`Pipeline.schedule_cron` drives real scheduling through a self-hosted
+Apache Airflow instance -- its own containers, its own Python
+environment, its own metadata database, wired up entirely through
+`docker-compose.yml` -- rather than a hand-rolled Celery-beat polling
+loop. See [ADR 0010](docs/decisions/0010-airflow-orchestration.md) for
+the full design.
+
+- `dags/pipeline_dag_factory.py` generates one DAG per active pipeline
+  at every DAG-parse cycle, by calling a new internal HTTP API
+  (`apps.orchestration_api`, bearer-token authenticated) -- it never
+  imports this project's code or touches its database directly.
+- Each generated DAG has two real, dependent tasks
+  (`trigger_run >> wait_for_completion`), not one opaque "run
+  everything" task -- a proper Airflow sensor polls run status and
+  raises on failure so Airflow's own retry/alerting layer sees it, on
+  top of (not instead of) `apps.execution.retry_policy`'s own
+  per-run retries.
+- The trigger endpoint is a thin wrapper around the exact same
+  `apps.execution.dispatch.trigger_manual_run` the CLI and web UI already
+  call -- there is only one implementation of "start a run."
+- Airflow's web UI is reachable at `localhost:8080` in the Docker Compose
+  setup for watching DAG runs, task logs, and retries.
+
+**Honestly flagged:** `apps.orchestration_api` has 16 passing tests. The
+Airflow side (the Docker Compose services and the DAG factory) has only
+been validated for syntax/config correctness -- there was no Docker
+daemon available in the environment this was built in, so it has not
+been run end to end yet. See [docs/roadmap.md](docs/roadmap.md) for the
+exact caveat. Treat it as needing a first real smoke test before relying
+on it in production.
+
 ## Stack
 
 Python / Django (web) + Celery/RabbitMQ (worker, scheduler) + PostgreSQL
 (platform metadata, via django-tenants for schema-per-tenant isolation) +
 SQLAlchemy Core (external database access) + HTTPX (API access) + MinIO/S3
 (immutable raw payload storage) + Django templates/HTMX (internal
-operator UI -- see [ADR 0008](docs/decisions/0008-internal-operator-ui.md)).
+operator UI -- see [ADR 0008](docs/decisions/0008-internal-operator-ui.md)) +
+Apache Airflow (self-hosted scheduling/orchestration -- see
+[ADR 0010](docs/decisions/0010-airflow-orchestration.md)).
 See [docs/architecture.md](docs/architecture.md).
 
 ## Getting started
@@ -183,6 +219,12 @@ docker compose run --rm web python manage.py migrate_schemas --shared
 docker compose run --rm web python manage.py provision_raw_store
 docker compose up
 ```
+
+Airflow (`airflow-init` / `airflow-webserver` / `airflow-scheduler` /
+`airflow-worker`) starts alongside the rest of `docker compose up` and
+needs a few more secrets generated first -- see the Airflow section of
+[docs/setup.md](docs/setup.md) for the exact steps and the honest
+"not yet runtime-verified" caveat.
 
 Full walkthrough, including creating your first organization and running
 tests: [docs/setup.md](docs/setup.md).
@@ -211,6 +253,13 @@ apps/
   auditing/        AuditLog + record_audit_event()
   opsui/           Internal operator UI: raw payload migration job model +
                     Celery task, permissions, views/urls/templates (see ADR 0008)
+  orchestration_api/ Internal HTTP API Airflow calls to list pipelines,
+                    trigger runs, and poll run status (see ADR 0010)
+dags/
+  pipeline_dag_factory.py  Airflow DAG factory (runs inside Airflow's own
+                    container, not Django's -- see ADR 0010)
+docker/
+  postgres-init/   One-time init script creating Airflow's separate metadata DB
 docs/
   architecture.md  Module boundaries, key abstractions, what's deferred
   setup.md         Local development guide

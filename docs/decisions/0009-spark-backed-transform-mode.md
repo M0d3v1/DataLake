@@ -137,11 +137,17 @@ alternative, so the specific vendor API isn't load-bearing everywhere.
   serverless backend -> bulk-load capability on the SQL Server connector
   (Postgres destination, still roadmap-only, would need the same
   treatment when it exists).
-- This does not, by itself, decide whether to bring in Airflow. Nothing
-  above needs a second orchestrator -- job submission and polling are a
-  Celery task like any other. Airflow only becomes relevant if the
-  product later needs DAG-level cross-job dependencies, which is a
-  separate, later decision.
+- **Update:** [ADR 0010](0010-airflow-orchestration.md) has since brought
+  in Airflow for scheduling/orchestration, ahead of this ADR's own
+  implementation. That means the "submit + poll" steps this ADR
+  describes as a Celery task are, once both land, better placed as
+  additional Airflow DAG tasks (`submit_spark_transform` /
+  `wait_for_spark_job`, conditional on `processing_mode == "spark"`) on
+  the same per-pipeline DAG ADR 0010 already generates -- rather than a
+  parallel Celery-only path. The core design here (Spark reads only from
+  immutable raw storage, writes back through the connector interface,
+  whitelisted expressions) is unchanged by that; only *which* system
+  submits/polls the job moves.
 - Not scoped here, deliberately: guided-schema-creation for bulk-load
   staging tables, a UI for authoring `transform_expr` (vs. hand-editing
   JSON), and Postgres destination bulk-load (blocked on the Postgres

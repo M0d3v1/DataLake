@@ -1,3 +1,48 @@
+x-airflow-common: &airflow-common
+  # Official image, unmodified -- its own Python environment, entirely
+  # separate from ./Dockerfile (the Django app's image). DAG tasks talk
+  # to apps.orchestration_api over plain HTTP via `requests` (already an
+  # Airflow core dependency), so no extra provider package is needed. If
+  # a future DAG genuinely needs one, add a docker/Dockerfile.airflow
+  # that extends this image rather than reaching for DockerOperator /
+  # host Docker-socket access -- see docs/decisions/0010-airflow-orchestration.md
+  # for why that access pattern was deliberately avoided.
+  #
+  # NOTE: verify this is still a current stable tag at
+  # https://hub.docker.com/r/apache/airflow/tags before first use --
+  # not checked against a live registry.
+  image: apache/airflow:2.10.4-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    # Own metadata database -- a separate Postgres *database*, not a
+    # schema in the platform's own "datalake" database. See
+    # docker/postgres-init/010-create-airflow-db.sql and
+    # docs/decisions/0010-airflow-orchestration.md.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${DATALAKE_POSTGRES_USER:-datalake}:${DATALAKE_POSTGRES_PASSWORD:-datalake}@postgres:5432/airflow
+    # CeleryExecutor is how Airflow distributes its *own* tasks -- this
+    # is a separate Celery app from apps.execution's, reusing the same
+    # RabbitMQ instance but a distinct queue so the two never collide.
+    AIRFLOW__CELERY__BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${DATALAKE_POSTGRES_USER:-datalake}:${DATALAKE_POSTGRES_PASSWORD:-datalake}@postgres:5432/airflow
+    AIRFLOW__CELERY__DEFAULT_QUEUE: airflow_default
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-insecure-dev-key-change-me}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    # How dags/pipeline_dag_factory.py reaches apps.orchestration_api --
+    # "web", the Django service's name on this compose network, not
+    # localhost. Token must match DATALAKE_ORCHESTRATION_API_TOKEN below.
+    ORCHESTRATION_API_BASE_URL: http://web:8000/internal/api
+    ORCHESTRATION_API_TOKEN: ${DATALAKE_ORCHESTRATION_API_TOKEN:-}
+  volumes:
+    - ./dags:/opt/airflow/dags
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -9,6 +54,10 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Runs once, only against a brand-new data volume -- creates the
+      # separate "airflow" database. See that file for why it's a
+      # separate database rather than a schema.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 5s
@@ -84,6 +133,55 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+
+  # --- Airflow: orchestration/scheduling layer, own containers, own
+  # metadata DB, own Python environment -- never imports this project's
+  # code, only ever calls apps.orchestration_api over HTTP. See
+  # docs/decisions/0010-airflow-orchestration.md. ------------------------
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USERNAME:-admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-change-me}" \
+          --firstname Admin --lastname User --role Admin \
+          --email "${AIRFLOW_ADMIN_EMAIL:-admin@example.test}" || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:

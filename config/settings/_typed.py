@@ -96,5 +96,13 @@ class Env(BaseSettings):
             h.strip() for h in self.outbound_http_insecure_allowed_hosts.split(",") if h.strip()
         ]
 
+    # --- Internal orchestration API (apps.orchestration_api) -------------
+    # Shared secret an external orchestrator (Airflow -- see
+    # docs/decisions/0010-airflow-orchestration.md) presents as a Bearer
+    # token. Empty by default, which the API treats as "not configured"
+    # and refuses every request (503), rather than falling open. Generate
+    # with e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+    orchestration_api_token: str = Field(default="")
+
 
 env = Env()

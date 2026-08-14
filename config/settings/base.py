@@ -37,6 +37,10 @@ SHARED_APPS = [
     # every tenant by a platform operator without switching schema first
     # -- see apps.opsui and docs/decisions/0008-internal-operator-ui.md.
     "apps.opsui",
+    # Internal HTTP API for an external orchestrator (Airflow) to
+    # discover pipelines and drive/observe runs -- see
+    # docs/decisions/0010-airflow-orchestration.md. No models of its own.
+    "apps.orchestration_api",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -194,6 +198,12 @@ OUTBOUND_HTTP_ALLOW_INSECURE_HTTP = env.outbound_http_allow_insecure_http
 OUTBOUND_HTTP_INSECURE_ALLOWED_HOSTS = env.outbound_http_insecure_allowed_hosts_list()
 OUTBOUND_HTTP_MAX_RESPONSE_BYTES = env.outbound_http_max_response_bytes
 OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS = env.outbound_http_max_timeout_seconds
+
+# --------------------------------------------------------------------------
+# Internal orchestration API (apps.orchestration_api). See
+# docs/decisions/0010-airflow-orchestration.md.
+# --------------------------------------------------------------------------
+ORCHESTRATION_API_TOKEN = env.orchestration_api_token
 
 # --------------------------------------------------------------------------
 # Structured logging. Django's own framework logs go through the plain

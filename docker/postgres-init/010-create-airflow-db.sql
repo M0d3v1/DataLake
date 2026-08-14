@@ -1,0 +1,11 @@
+-- Runs once, only on first-ever startup of the postgres container's data
+-- volume (Postgres only executes /docker-entrypoint-initdb.d/* the very
+-- first time it initializes a fresh data directory -- not on every
+-- restart, and not if postgres_data already has data in it).
+--
+-- Airflow's own metadata lives in a separate DATABASE on this same
+-- Postgres instance, never a schema inside the platform's own
+-- "datalake" database -- keeps django-tenants' schema-per-tenant
+-- bookkeeping and Airflow's own migrations from ever being able to
+-- collide. See docs/decisions/0010-airflow-orchestration.md.
+CREATE DATABASE airflow;

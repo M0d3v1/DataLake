@@ -27,21 +27,38 @@ sanitization before logging, and the Django 5.2 LTS upgrade. Most
 recently, a minimal internal operator UI (Django templates + HTMX) made
 two previously shell-only workflows -- raw payload storage migration and
 pipeline-run continuation -- reachable without shell access (see
-[ADR 0008](decisions/0008-internal-operator-ui.md)). This document
-reflects the current state and notes what's deliberately still deferred.
+[ADR 0008](decisions/0008-internal-operator-ui.md)), and a self-hosted
+Airflow instance now provides real scheduling and orchestration (see
+[ADR 0010](decisions/0010-airflow-orchestration.md); [ADR 0009](decisions/0009-spark-backed-transform-mode.md)
+scopes a still-unbuilt, opt-in Spark transform mode Airflow will also
+orchestrate once it exists). This document reflects the current state
+and notes what's deliberately still deferred.
 
 ## Process topology
 
 One Django codebase, three runtime processes, sharing the same code and
-settings:
+settings, plus a fully separate Airflow deployment:
 
-- **web** -- Django (templates + HTMX/Alpine), the UI and (later) a REST API.
+- **web** -- Django (templates + HTMX, the operator UI) + the internal
+  orchestration API (`apps.orchestration_api`).
 - **worker** -- Celery, executes pipeline runs.
-- **scheduler** -- Celery beat, triggers scheduled runs (Milestone 3).
+- **scheduler** -- Celery beat (currently only used for the operator
+  UI's own internal upkeep, if any is added later; pipeline scheduling
+  itself now goes through Airflow, not this process -- see below).
+- **airflow-webserver / airflow-scheduler / airflow-worker** -- a
+  separate Airflow deployment (own containers, own Python environment,
+  own metadata database) that decides *when* a pipeline runs and
+  observes *whether it finished*, talking to **web** only over the
+  internal orchestration API -- never importing this project's code or
+  touching its database directly. See
+  [ADR 0010](decisions/0010-airflow-orchestration.md).
 
-Infrastructure: PostgreSQL (platform metadata, one instance, many schemas --
-see multi-tenancy below), RabbitMQ (Celery broker), MinIO/S3 (raw payload
-storage). All defined in `docker-compose.yml` for local development.
+Infrastructure: PostgreSQL (platform metadata, one instance, many schemas
+for this platform's own data -- see multi-tenancy below -- plus one
+separate *database* for Airflow's own metadata), RabbitMQ (broker for
+both this platform's Celery app and, on a separate queue, Airflow's own
+CeleryExecutor), MinIO/S3 (raw payload storage). All defined in
+`docker-compose.yml` for local development.
 
 ## Multi-tenancy: schema-per-tenant
 
@@ -74,6 +91,7 @@ internals.
 | `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata, `apps.rawstore.migration` (legacy-key migration service) |
 | `auditing` | `AuditLog` + `record_audit_event()` |
 | `opsui` | Internal operator UI: `RawPayloadMigrationJob` (public schema), permissions, views/urls/templates for raw payload migration and pipeline run/continuation -- see [ADR 0008](decisions/0008-internal-operator-ui.md) |
+| `orchestration_api` | Internal, bearer-token-authenticated HTTP API (public schema) that Airflow's DAG factory calls to list pipelines, trigger runs, and poll run status -- a thin wrapper around `apps.execution.dispatch.trigger_manual_run`, not a second implementation of triggering. See [ADR 0010](decisions/0010-airflow-orchestration.md) |
 
 ## Internal vs. external data access
 
@@ -266,13 +284,16 @@ extract/load steps and across processes.
 ## What's deliberately not here yet
 
 See `docs/roadmap.md` for the full list with rationale. In short:
-scheduling (Celery beat actually triggering runs), PostgreSQL
-source/destination connectors, SQL Server *source* queries, guided
-destination table/index/relationship design, upsert/CDC and incremental
-watermarks across runs, unrestricted custom SQL, a self-service
-normal-user web UI (configuring connections/pipelines -- distinct from
-the internal operator UI, which now exists), production secret-manager
-integration, and analytics dashboards. Restricted advanced SQL execution
-in particular is deliberately deferred pending its own design review --
-it's the highest-risk feature in the product (see the Milestone 1 design
-proposal's risk list).
+Spark-backed distributed transforms for high-volume pipelines (ADR 0009,
+scoped but not built), PostgreSQL source/destination connectors, SQL
+Server *source* queries, guided destination table/index/relationship
+design, upsert/CDC and incremental watermarks across runs, unrestricted
+custom SQL, a self-service normal-user web UI (configuring
+connections/pipelines -- distinct from the internal operator UI, which
+now exists), production secret-manager integration, and analytics
+dashboards. Restricted advanced SQL execution in particular is
+deliberately deferred pending its own design review -- it's the
+highest-risk feature in the product (see the Milestone 1 design
+proposal's risk list). Scheduling/orchestration itself is no longer on
+this list -- it's built via self-hosted Airflow (ADR 0010), though still
+flagged in the roadmap as not yet runtime-verified end to end.
