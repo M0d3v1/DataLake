@@ -12,6 +12,23 @@ pipelines only run via manual trigger (`apps.execution.dispatch`,
 that reads active schedules and dispatches runs, using the same
 `trigger_manual_run`-style dedup so a schedule tick never double-dispatches.
 
+## Spark-backed transform mode for high-volume pipelines
+
+Every pipeline currently transforms records in-process, page by page,
+via a deliberately simple mapper (no expressions -- see
+`apps.pipelines.mapping`). That's the right default for the volumes this
+platform targets, but doesn't scale to a pipeline that genuinely needs
+distributed transforms (large joins/aggregations across a run). See
+[ADR 0009](decisions/0009-spark-backed-transform-mode.md) (Proposed, not
+built) for the full design: an opt-in per-pipeline mode where Spark reads
+only from already-checksummed immutable raw storage (never the live
+source directly), writes back through the normal
+`DestinationConnector` interface (a new bulk-load capability, not a
+bypass), and a whitelisted (never `eval`) expression grammar for
+per-column transforms -- the expression grammar specifically needs its
+own security review before implementation, the same posture as
+unrestricted custom SQL below.
+
 ## PostgreSQL source and destination connectors
 
 Only `rest_api` (source) and `sqlserver` (destination) exist. A
