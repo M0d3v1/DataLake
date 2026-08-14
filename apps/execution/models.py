@@ -35,9 +35,19 @@ class PipelineRun(TimeStampedModel):
         MANUAL = "manual", "Manual"
         SCHEDULED = "scheduled", "Scheduled"
 
+    class Phase(models.TextChoices):
+        """Only meaningful while `status == RUNNING`, and only ever set
+        for a Spark-mode pipeline (`Pipeline.processing_mode == SPARK`) --
+        a plain Python-mode run's `phase` stays null throughout. See
+        docs/decisions/0009-spark-backed-transform-mode.md."""
+
+        EXTRACTING = "extracting", "Extracting"
+        TRANSFORMING = "transforming", "Transforming"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     pipeline = models.ForeignKey(Pipeline, on_delete=models.CASCADE, related_name="runs")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    phase = models.CharField(max_length=20, choices=Phase.choices, null=True, blank=True)
     trigger = models.CharField(max_length=20, choices=Trigger.choices, default=Trigger.MANUAL)
     idempotency_key = models.CharField(max_length=255, unique=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -69,6 +79,17 @@ class PipelineRun(TimeStampedModel):
     records_extracted = models.PositiveIntegerField(default=0)
     records_loaded = models.PositiveIntegerField(default=0)
     raw_payload_count = models.PositiveIntegerField(default=0)
+    # Spark mode only (see Phase above): rows the submitted job routed to
+    # a dead-letter path instead of aborting the whole batch -- distinct
+    # from records_extracted/records_loaded, which stay 0 for the
+    # transform phase itself (Spark writes destination rows via a bulk
+    # load, not one `load()` call per page like the Python-mode path).
+    records_failed = models.PositiveIntegerField(default=0)
+    # External Spark job identifiers (apps.sparktransform.backends) --
+    # set when submit_spark_transform() dispatches this run's job,
+    # updated by poll_spark_transform_task on every poll.
+    spark_job_id = models.CharField(max_length=255, null=True, blank=True)
+    spark_job_status = models.CharField(max_length=50, null=True, blank=True)
 
     # Sanitized (apps.core.redaction) -- never raw exception text that
     # might echo request/response content.

@@ -16,6 +16,10 @@ class Pipeline(TimeStampedModel):
     pipelines only run when manually triggered.
     """
 
+    class ProcessingMode(models.TextChoices):
+        PYTHON = "python", "Python (in-process mapper)"
+        SPARK = "spark", "Spark (distributed transform)"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
     source_connection = models.ForeignKey(
@@ -40,6 +44,13 @@ class Pipeline(TimeStampedModel):
     # See apps.pipelines.mapping.map_record: strict raises on a missing
     # source field instead of substituting null.
     strict_mapping = models.BooleanField(default=False)
+    # PYTHON (default): destination_mapping + apps.pipelines.mapping, the
+    # existing in-process per-page mapper. SPARK: destination_mapping is
+    # ignored; apps.sparktransform.models.SparkTransformConfig (a
+    # required one-to-one) takes over instead -- see ADR 0009.
+    processing_mode = models.CharField(
+        max_length=20, choices=ProcessingMode.choices, default=ProcessingMode.PYTHON
+    )
     schedule_cron = models.CharField(max_length=100, null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_by = models.ForeignKey(

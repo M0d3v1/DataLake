@@ -399,3 +399,98 @@ class ClaimRejectionTests(OrchestrationTestCase):
             run_pipeline(run_id=str(run.id), celery_task_id="task-1", is_final_attempt=False)
 
         self.assertFalse(TaskExecution.objects.filter(run=run).exists())
+
+
+class SparkModeTests(OrchestrationTestCase):
+    """See docs/decisions/0009-spark-backed-transform-mode.md. Spark mode
+    only changes what happens *after* extraction: the same claim/retry
+    machinery, the same page-by-page raw-store loop -- but instead of
+    in-process map+load, extraction hands off to
+    apps.sparktransform.services.submit_spark_transform and the run stays
+    RUNNING (not finalized here) until a later, separate Celery task
+    observes the Spark job's terminal status."""
+
+    def _make_spark_pipeline(self, **overrides) -> Pipeline:
+        pipeline = self._make_pipeline(**overrides)
+        pipeline.processing_mode = Pipeline.ProcessingMode.SPARK
+        pipeline.save(update_fields=["processing_mode"])
+        return pipeline
+
+    @respx.mock
+    def test_extracts_every_page_then_hands_off_without_finalizing_the_run(self):
+        respx.get(f"{BASE_URL}/v1/policies", params={"page": "1"}).mock(
+            return_value=httpx.Response(200, json={"results": [{"id": "P-1", "premium": 100}]})
+        )
+        respx.get(f"{BASE_URL}/v1/policies", params={"page": "2"}).mock(
+            return_value=httpx.Response(200, json={"results": []})
+        )
+
+        pipeline = self._make_spark_pipeline()
+        run = self._make_run(pipeline)
+
+        with patch("apps.sparktransform.services.submit_spark_transform") as mock_submit:
+            run_pipeline(run_id=str(run.id), celery_task_id="task-1", is_final_attempt=True)
+
+        mock_submit.assert_called_once()
+        (submitted_run,) = mock_submit.call_args.args
+        self.assertEqual(submitted_run.id, run.id)
+
+        run.refresh_from_db()
+        # Handed off, not finalized -- apps.sparktransform.services.
+        # finalize_spark_transform (via poll_spark_transform_task) is the
+        # only thing that ever marks a Spark-mode run SUCCEEDED/FAILED.
+        self.assertEqual(run.status, PipelineRun.Status.RUNNING)
+        self.assertEqual(run.phase, PipelineRun.Phase.EXTRACTING)
+        self.assertEqual(run.pages_extracted, 1)
+        self.assertEqual(run.records_extracted, 1)
+        self.assertEqual(run.records_loaded, 0)  # nothing loaded yet -- that's Spark's job
+        self.assertEqual(run.raw_payload_count, 1)
+
+        task_execution = TaskExecution.objects.get(run=run)
+        self.assertEqual(task_execution.status, TaskExecution.Status.SUCCEEDED)
+        self.assertIsNotNone(task_execution.finished_at)
+
+        # loaded_successfully means "loaded to the destination", which
+        # hasn't happened yet at extraction time in Spark mode.
+        raw_record = RawPayloadRecord.objects.get(run=run, sequence=1)
+        self.assertFalse(raw_record.loaded_successfully)
+
+    @respx.mock
+    def test_extraction_failure_fails_the_run_without_ever_reaching_spark_submission(self):
+        respx.get(f"{BASE_URL}/v1/policies", params={"page": "1"}).mock(
+            return_value=httpx.Response(503)
+        )
+
+        pipeline = self._make_spark_pipeline()
+        run = self._make_run(pipeline)
+
+        from apps.core.exceptions import FetchFailed
+
+        with patch("apps.sparktransform.services.submit_spark_transform") as mock_submit:
+            with self.assertRaises(FetchFailed):
+                run_pipeline(run_id=str(run.id), celery_task_id="task-1", is_final_attempt=True)
+
+        mock_submit.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.status, PipelineRun.Status.FAILED)
+        self.assertEqual(run.error_category, "FetchFailed")
+
+    def test_spark_mode_does_not_require_a_destination_mapping(self):
+        # Spark mode uses SparkTransformConfig instead of
+        # destination_mapping -- an empty destination_mapping must not
+        # raise MappingError the way Python mode's does.
+        pipeline = self._make_spark_pipeline(destination_mapping={})
+        run = self._make_run(pipeline)
+
+        with (
+            respx.mock,
+            patch("apps.sparktransform.services.submit_spark_transform") as mock_submit,
+        ):
+            respx.get(f"{BASE_URL}/v1/policies", params={"page": "1"}).mock(
+                return_value=httpx.Response(200, json={"results": []})
+            )
+            run_pipeline(run_id=str(run.id), celery_task_id="task-1", is_final_attempt=True)
+
+        mock_submit.assert_called_once()
+        run.refresh_from_db()
+        self.assertEqual(run.status, PipelineRun.Status.RUNNING)

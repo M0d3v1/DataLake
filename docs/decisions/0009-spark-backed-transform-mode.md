@@ -2,9 +2,27 @@
 
 ## Status
 
-**Proposed.** Not implemented. Written to scope the work before committing
-to it -- nothing here changes runtime behavior until a follow-up ADR
-moves this to Accepted and the code lands.
+**Accepted and built.** The design below is now implemented: `apps.sparktransform`
+(`SparkTransformConfig`, the whitelisted `transform_expr` grammar,
+job submission/polling against a pluggable `SparkJobBackend`),
+`Pipeline.processing_mode`, `PipelineRun.phase`/`spark_job_id`/
+`spark_job_status`/`records_failed`, `DestinationConnector.bulk_load()`
+(implemented for the SQL Server connector), and the standalone PySpark
+driver (`spark_jobs/transform_job.py`) it submits.
+
+Honestly flagged, the same posture as ADR 0010's Airflow integration:
+`apps.sparktransform`'s Django-side code (grammar parser/compiler,
+services, the Celery poll task, the SQL Server `bulk_load` staging-table
+path) has 105 passing tests, all against mocked backends/connections --
+there is no AWS account, live EMR Serverless application, or PySpark
+installation available in the environment this was built in. The
+`EmrServerlessBackend` (boto3 `emr-serverless` calls) and
+`spark_jobs/transform_job.py` (the actual PySpark driver) have only been
+checked for syntax/type correctness (`ruff check`, `python -m py_compile`)
+-- neither has ever submitted or run a real Spark job. Treat this as
+needing a first real smoke test (a real EMR Serverless application, a
+real pipeline in Spark mode, a real run) before relying on it in
+production -- see docs/roadmap.md.
 
 ## Context
 
@@ -115,11 +133,12 @@ recommended target is a serverless job API (AWS EMR Serverless, Databricks
 Jobs API, or GCP Dataproc Serverless -- final choice depends on which
 cloud the rest of the deployment already lives on) where a job is
 submitted, runs, and bills only for the run. This is a deployment/ops
-decision, not a code dependency -- `apps.sparktransform` (proposed new
-TENANT_APPS module holding `SparkTransformConfig` + the submit/poll
-logic) should talk to whichever backend through a small interface, the
-same way `apps.rawstore.base.RawPayloadStore` abstracts S3 vs. a future
-alternative, so the specific vendor API isn't load-bearing everywhere.
+decision, not a code dependency -- `apps.sparktransform.backends.base.SparkJobBackend`
+is the interface (same shape as `apps.rawstore.base.RawPayloadStore`);
+`apps.sparktransform.backends.emr_serverless.EmrServerlessBackend` is
+the one implementation built so far, via boto3. Swapping to Databricks
+or Dataproc Serverless means implementing the same two-method interface,
+not changing calling code.
 
 ## Consequences
 
@@ -129,25 +148,33 @@ alternative, so the specific vendor API isn't load-bearing everywhere.
 - The immutable raw-payload store becomes double-duty: it's both the
   audit trail (existing job) and the input dataset for Spark (new job).
   No new extraction code path, no new place bytes can enter the system
-  unchecksummed.
-- Real new work, roughly in build order: `SparkTransformConfig` +
-  whitelisted expression grammar (needs its own security review before
-  merge) -> `processing_mode`/`phase`/`spark_job_id`/`records_failed` on
-  `PipelineRun` + migration -> job submission/polling against one chosen
-  serverless backend -> bulk-load capability on the SQL Server connector
-  (Postgres destination, still roadmap-only, would need the same
-  treatment when it exists).
-- **Update:** [ADR 0010](0010-airflow-orchestration.md) has since brought
-  in Airflow for scheduling/orchestration, ahead of this ADR's own
-  implementation. That means the "submit + poll" steps this ADR
-  describes as a Celery task are, once both land, better placed as
-  additional Airflow DAG tasks (`submit_spark_transform` /
-  `wait_for_spark_job`, conditional on `processing_mode == "spark"`) on
-  the same per-pipeline DAG ADR 0010 already generates -- rather than a
-  parallel Celery-only path. The core design here (Spark reads only from
-  immutable raw storage, writes back through the connector interface,
-  whitelisted expressions) is unchanged by that; only *which* system
-  submits/polls the job moves.
+  unchecksummed. `apps.execution.orchestration._extract_only` does
+  exactly the same page-fetch-and-store loop `_extract_and_load` does
+  for Python mode; the two paths only diverge after extraction finishes.
+- Built, roughly in the order this ADR laid out: `SparkTransformConfig` +
+  whitelisted expression grammar (`apps.sparktransform.expr` -- a
+  hand-written recursive-descent parser, never `eval`/`exec`, matching
+  `apps.authproviders.token_support`'s existing security posture) ->
+  `processing_mode`/`phase`/`spark_job_id`/`spark_job_status`/
+  `records_failed` on `Pipeline`/`PipelineRun` + migrations -> job
+  submission/polling against `EmrServerlessBackend` -> `bulk_load()` on
+  the SQL Server connector (a staging-table + single bulk transaction,
+  not yet a true out-of-core file-based bulk copy -- see that method's
+  docstring). Postgres destination bulk-load remains blocked on the
+  Postgres destination connector itself, which still doesn't exist.
+- **Still Celery, not yet an Airflow DAG task:** [ADR 0010](0010-airflow-orchestration.md)
+  brought in Airflow for scheduling/orchestration after this ADR was
+  first written. The design note that follows is still open, not yet
+  acted on: `apps.sparktransform.tasks.poll_spark_transform_task` today
+  is a Celery task (mirroring `apps.execution.tasks.run_pipeline_task`'s
+  shape) dispatched directly from `submit_spark_transform`, not an
+  Airflow DAG task. Moving "submit + poll" onto the same per-pipeline DAG
+  ADR 0010 generates (as `submit_spark_transform`/`wait_for_spark_job`
+  tasks, conditional on `processing_mode == "spark"`) is real,
+  not-yet-done follow-up work -- the core design here (Spark reads only
+  from immutable raw storage, writes back through the connector
+  interface, whitelisted expressions) doesn't change if that move
+  happens; only *which* system submits/polls the job would.
 - Not scoped here, deliberately: guided-schema-creation for bulk-load
   staging tables, a UI for authoring `transform_expr` (vs. hand-editing
   JSON), and Postgres destination bulk-load (blocked on the Postgres

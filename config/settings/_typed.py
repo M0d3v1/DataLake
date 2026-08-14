@@ -104,5 +104,25 @@ class Env(BaseSettings):
     # with e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
     orchestration_api_token: str = Field(default="")
 
+    # --- Spark-backed transform mode (apps.sparktransform) ---------------
+    # See docs/decisions/0009-spark-backed-transform-mode.md. Default
+    # backend is AWS EMR Serverless; swapping to another serverless Spark
+    # platform (Databricks Jobs API, GCP Dataproc Serverless) means
+    # pointing this at another apps.sparktransform.backends.base.SparkJobBackend
+    # implementation, not changing calling code.
+    spark_job_backend: str = Field(
+        default="apps.sparktransform.backends.emr_serverless.EmrServerlessBackend"
+    )
+    spark_aws_region: str = Field(default="us-east-1")
+    # The EMR Serverless application (a pre-created, standing Spark
+    # runtime configuration) and IAM role the submitted job runs as --
+    # both deployment/ops-provisioned, never created by this codebase.
+    spark_emr_application_id: str = Field(default="")
+    spark_emr_execution_role_arn: str = Field(default="")
+    # S3 URI of the Spark job driver script (spark_jobs/transform_job.py
+    # in this repo) that EMR Serverless actually runs -- uploaded there
+    # as a separate deployment step, not by this codebase at runtime.
+    spark_job_entry_point_s3_uri: str = Field(default="")
+
 
 env = Env()

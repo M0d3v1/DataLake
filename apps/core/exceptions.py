@@ -132,6 +132,44 @@ class RawPayloadAccessDenied(DataLakeError):
         super().__init__(message, retryable=False, category="RawPayloadAccessDenied")
 
 
+class TransformExpressionError(DataLakeError):
+    """A Spark-mode column's `transform_expr` (apps.sparktransform.expr)
+    doesn't parse against the whitelisted expression grammar -- an
+    unknown function, a disallowed CAST target type, unbalanced
+    parentheses, or anything else outside the small, explicit,
+    non-Turing-complete grammar ADR 0009 defines. Always raised at
+    pipeline/config save time, never at run time: this is a
+    configuration mistake, not a transient condition, so it is always
+    non-retryable. Never `eval`/`exec` -- see apps.sparktransform.expr."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False, category="TransformExpressionError")
+
+
+class SparkJobSubmissionError(DataLakeError):
+    """A Spark transform job could not be submitted to the configured
+    `SparkJobBackend` (apps.sparktransform.backends) -- e.g. the backend
+    API rejected the request, or is unreachable. Retryable: a transient
+    backend/network issue submitting the job is exactly the kind of
+    thing a retry can resolve, unlike a job that was accepted and then
+    failed on its own merits (see SparkJobFailedError)."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=True, category="SparkJobSubmissionError")
+
+
+class SparkJobFailedError(DataLakeError):
+    """A submitted Spark transform job reached a terminal failed state
+    (reported by the external job backend), as opposed to a transient
+    polling/connectivity problem. Always non-retryable at the polling
+    layer -- re-submitting the identical job against the identical
+    input is a deliberate new attempt (a fresh run), not something the
+    poll task should do automatically."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False, category="SparkJobFailedError")
+
+
 class RawPayloadIntegrityError(DataLakeError):
     """A raw payload object's actual content didn't match what its
     content-addressed key promised: a `put()` found an existing object

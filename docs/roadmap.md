@@ -30,20 +30,34 @@ first real smoke test before relying on it.
 
 ## Spark-backed transform mode for high-volume pipelines
 
-Every pipeline currently transforms records in-process, page by page,
-via a deliberately simple mapper (no expressions -- see
-`apps.pipelines.mapping`). That's the right default for the volumes this
-platform targets, but doesn't scale to a pipeline that genuinely needs
-distributed transforms (large joins/aggregations across a run). See
-[ADR 0009](decisions/0009-spark-backed-transform-mode.md) (Proposed, not
-built) for the full design: an opt-in per-pipeline mode where Spark reads
-only from already-checksummed immutable raw storage (never the live
-source directly), writes back through the normal
-`DestinationConnector` interface (a new bulk-load capability, not a
-bypass), and a whitelisted (never `eval`) expression grammar for
-per-column transforms -- the expression grammar specifically needs its
-own security review before implementation, the same posture as
-unrestricted custom SQL below.
+**Built, not yet runtime-verified.** Every pipeline still transforms
+records in-process, page by page, by default (the simple mapper,
+`apps.pipelines.mapping`, no expressions) -- that's the right default for
+the volumes this platform targets. A pipeline that genuinely needs
+distributed transforms (large joins/aggregations across a run) can opt
+in per-pipeline (`Pipeline.processing_mode = "spark"`): Spark reads only
+from already-checksummed immutable raw storage (never the live source
+directly, via `apps.execution.orchestration._extract_only`), applies a
+whitelisted (never `eval`) expression grammar
+(`apps.sparktransform.expr`) to each column, and writes back through the
+normal `DestinationConnector` interface (a `bulk_load()` capability, not
+a bypass -- implemented for SQL Server). See
+[ADR 0009](decisions/0009-spark-backed-transform-mode.md) for the full
+design and build order.
+
+Honestly flagged, same posture as Scheduling above: the Django side
+(`apps.sparktransform`, plus the `bulk_load()` additions to
+`apps.connectors` and the Spark-mode branch in
+`apps.execution.orchestration`) has 101 new passing tests, all against
+mocked backends --
+no real AWS account, EMR Serverless application, or PySpark installation
+was available while building this. `EmrServerlessBackend` (the boto3
+`emr-serverless` client calls) and `spark_jobs/transform_job.py` (the
+actual PySpark driver script the job runs) have only been
+syntax/type-checked, never submitted to or run against a live Spark
+cluster. Treat Spark mode as needing a first real smoke test -- a real
+EMR Serverless application, a real Spark-mode pipeline, a real run --
+before relying on it in production.
 
 ## PostgreSQL source and destination connectors
 

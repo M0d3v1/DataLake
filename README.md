@@ -14,14 +14,16 @@ restricted advanced SQL).
 ## Status
 
 **Milestone 2, a correctness/security hardening pass, a follow-up
-review-fix pass, a minimal internal operator UI, and a self-hosted
-Apache Airflow orchestration layer.** A fictional authenticated,
-paginated REST API can be configured as a source, its responses are
-stored immutably before mapping, mapped records are loaded into a SQL
-Server destination in bounded batches, and the whole run is manually
-triggerable, retried, resumed via an explicit continuation after a
-page-limit failure, scheduled and observed by Airflow, and recorded in
-execution history. Runs on Django 5.2 LTS. See
+review-fix pass, a minimal internal operator UI, a self-hosted Apache
+Airflow orchestration layer, and an opt-in Apache Spark transform mode.**
+A fictional authenticated, paginated REST API can be configured as a
+source, its responses are stored immutably before mapping, mapped
+records are loaded into a SQL Server destination in bounded batches (or,
+for a pipeline that opts into Spark mode, transformed by a submitted
+Spark job instead), and the whole run is manually triggerable, retried,
+resumed via an explicit continuation after a page-limit failure,
+scheduled and observed by Airflow, and recorded in execution history.
+Runs on Django 5.2 LTS. See
 [docs/architecture.md](docs/architecture.md) for what's built vs.
 deliberately deferred, [docs/decisions/](docs/decisions/) for the
 reasoning behind the major structural choices, and
@@ -198,6 +200,41 @@ been run end to end yet. See [docs/roadmap.md](docs/roadmap.md) for the
 exact caveat. Treat it as needing a first real smoke test before relying
 on it in production.
 
+## Spark-backed transform mode
+
+Every pipeline transforms records in-process by default (a deliberately
+simple mapper, no expressions -- see `apps.pipelines.mapping`), which is
+the right choice for the volumes this platform targets. A pipeline that
+genuinely needs distributed transforms (large joins/aggregations across
+a run) can opt in per-pipeline (`Pipeline.processing_mode = "spark"`)
+instead. See [ADR 0009](docs/decisions/0009-spark-backed-transform-mode.md)
+for the full design.
+
+- Spark only ever reads from already-checksummed immutable raw payload
+  storage -- never the live source directly -- so the audit trail never
+  forks depending on which transform engine ran a pipeline.
+- Each column's transform is a small, whitelisted, non-Turing-complete
+  expression (`TRIM`, `UPPER`/`LOWER`, `CAST AS <type>`, basic
+  arithmetic -- see `apps.sparktransform.expr`), parsed and compiled to
+  Spark SQL at job-submission time, never `eval`/`exec`.
+- The submitted Spark job's output is bulk-loaded back through the
+  destination connector's `bulk_load()` method (a staging table + single
+  bulk transaction for SQL Server) -- not a second, unaudited write path.
+- Job submission targets AWS EMR Serverless by default
+  (`apps.sparktransform.backends.emr_serverless.EmrServerlessBackend`,
+  via boto3), behind a small `SparkJobBackend` interface so another
+  serverless Spark platform is a drop-in swap, not a rewrite.
+
+**Honestly flagged:** `apps.sparktransform`'s Django-side code (the
+grammar, services, the poll task, SQL Server's `bulk_load()`) has 101
+passing tests, all against mocked backends. There was no AWS account,
+live EMR Serverless application, or PySpark installation available while
+building this -- `EmrServerlessBackend` and the actual PySpark driver
+(`spark_jobs/transform_job.py`) have only been syntax/type-checked, never
+submitted to or run against a real Spark cluster. Treat it the same as
+the Airflow integration above: needing a first real smoke test before
+relying on it in production.
+
 ## Stack
 
 Python / Django (web) + Celery/RabbitMQ (worker, scheduler) + PostgreSQL
@@ -206,7 +243,9 @@ SQLAlchemy Core (external database access) + HTTPX (API access) + MinIO/S3
 (immutable raw payload storage) + Django templates/HTMX (internal
 operator UI -- see [ADR 0008](docs/decisions/0008-internal-operator-ui.md)) +
 Apache Airflow (self-hosted scheduling/orchestration -- see
-[ADR 0010](docs/decisions/0010-airflow-orchestration.md)).
+[ADR 0010](docs/decisions/0010-airflow-orchestration.md)) + Apache Spark
+(opt-in, per-pipeline distributed transform mode via AWS EMR Serverless
+-- see [ADR 0009](docs/decisions/0009-spark-backed-transform-mode.md)).
 See [docs/architecture.md](docs/architecture.md).
 
 ## Getting started
@@ -247,6 +286,9 @@ apps/
   pipelines/       Pipeline model + destination-mapping mapper
   execution/       PipelineRun, TaskExecution, orchestration/claims/dispatch/
                     retry_policy, the Celery task, `run_pipeline` management command
+  sparktransform/  SparkTransformConfig, whitelisted transform_expr grammar,
+                    SparkJobBackend + EmrServerlessBackend, poll_spark_transform_task
+                    (see ADR 0009)
   rawstore/        RawPayloadStore interface + S3/MinIO backend (tenant-scoped,
                     content-addressed, never-overwrite), migration service +
                     `provision_raw_store`/`migrate_raw_payload_storage` commands
@@ -258,6 +300,9 @@ apps/
 dags/
   pipeline_dag_factory.py  Airflow DAG factory (runs inside Airflow's own
                     container, not Django's -- see ADR 0010)
+spark_jobs/
+  transform_job.py Standalone PySpark driver submitted for Spark-mode
+                    pipelines -- never imports Django code (see ADR 0009)
 docker/
   postgres-init/   One-time init script creating Airflow's separate metadata DB
 docs/

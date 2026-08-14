@@ -239,6 +239,103 @@ def test_engine_is_disposed_even_when_load_succeeds():
     mock_engine.dispose.assert_called_once()
 
 
+# --- bulk_load(): Spark mode's faster destination write --------------
+
+
+def test_capabilities_declare_bulk_load_support():
+    assert SqlServerDestinationConnector.capabilities.supports_bulk_load is True
+
+
+def test_bulk_load_rejects_unsupported_mode():
+    connector = _connector()
+    with pytest.raises(UnsupportedCapability):
+        connector.bulk_load(CREDENTIAL, [{"id": 1}], mode="upsert")
+
+
+def test_bulk_load_with_no_records_is_a_noop():
+    connector = _connector()
+    assert connector.bulk_load(CREDENTIAL, [], mode="append") == 0
+
+
+def test_bulk_load_rejects_invalid_bulk_batch_size():
+    connector = _connector(bulk_batch_size=0)
+    fake_table = _fake_table({"id"})
+    with patch.object(SqlServerDestinationConnector, "_reflect_table", return_value=fake_table):
+        with pytest.raises(ConfigurationError):
+            connector.bulk_load(CREDENTIAL, [{"id": 1}], mode="append")
+
+
+def test_bulk_load_stages_then_moves_data_in_one_transaction():
+    connector = _connector(bulk_batch_size=2)
+    mock_conn = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.begin.return_value.__enter__.return_value = mock_conn
+    fake_table = _fake_table({"id"})
+    staging_table = _fake_table({"id"})
+    records = [{"id": i} for i in range(5)]
+
+    with (
+        patch("apps.connectors.destinations.sqlserver.sa.create_engine", return_value=mock_engine),
+        patch.object(SqlServerDestinationConnector, "_reflect_table", return_value=fake_table),
+        patch("apps.connectors.destinations.sqlserver.sa.Table", return_value=staging_table),
+    ):
+        loaded = connector.bulk_load(CREDENTIAL, records, mode="append")
+
+    assert loaded == 5
+    # CREATE staging (1) + batched inserts into staging (2, 2, 1 -> 3) +
+    # INSERT...SELECT into destination (1) + DROP staging (1) = 6.
+    assert mock_conn.execute.call_count == 6
+    mock_engine.begin.assert_called_once()
+    mock_engine.dispose.assert_called_once()
+
+
+def test_bulk_load_uses_a_freshly_generated_staging_table_name_each_call():
+    connector = _connector()
+    fake_table = _fake_table({"id"})
+    staging_table = _fake_table({"id"})
+    seen_staging_names = []
+
+    def fake_sa_table(name, metadata, **kwargs):
+        seen_staging_names.append(name)
+        return staging_table
+
+    mock_conn = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.begin.return_value.__enter__.return_value = mock_conn
+
+    with (
+        patch("apps.connectors.destinations.sqlserver.sa.create_engine", return_value=mock_engine),
+        patch.object(SqlServerDestinationConnector, "_reflect_table", return_value=fake_table),
+        patch("apps.connectors.destinations.sqlserver.sa.Table", side_effect=fake_sa_table),
+    ):
+        connector.bulk_load(CREDENTIAL, [{"id": 1}], mode="append")
+        connector.bulk_load(CREDENTIAL, [{"id": 2}], mode="append")
+
+    assert len(seen_staging_names) == 2
+    assert seen_staging_names[0] != seen_staging_names[1]
+    for name in seen_staging_names:
+        assert name.startswith("__bulk_staging_")
+
+
+def test_bulk_load_classifies_operational_error_as_retryable():
+    connector = _connector()
+    mock_engine = MagicMock()
+    mock_engine.begin.side_effect = sa.exc.OperationalError(
+        "stmt", {}, Exception("connection lost")
+    )
+    fake_table = _fake_table({"id"})
+
+    with (
+        patch("apps.connectors.destinations.sqlserver.sa.create_engine", return_value=mock_engine),
+        patch.object(SqlServerDestinationConnector, "_reflect_table", return_value=fake_table),
+    ):
+        with pytest.raises(LoadFailed) as exc_info:
+            connector.bulk_load(CREDENTIAL, [{"id": 1}], mode="append")
+
+    assert exc_info.value.retryable is True
+    mock_engine.dispose.assert_called_once()
+
+
 def test_engine_created_fresh_and_disposed_per_call():
     connector = _connector()
     mock_conn = MagicMock()

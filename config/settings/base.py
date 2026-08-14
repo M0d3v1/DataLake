@@ -60,6 +60,12 @@ TENANT_APPS = [
     "apps.connections",
     "apps.pipelines",
     "apps.execution",
+    # Spark-backed distributed transform mode -- opt-in per pipeline
+    # (Pipeline.processing_mode == "spark"). See
+    # docs/decisions/0009-spark-backed-transform-mode.md. Depends on
+    # apps.pipelines/apps.execution (via deferred imports, to avoid a
+    # circular import -- see apps.execution.orchestration._execute).
+    "apps.sparktransform",
     "apps.rawstore",
     "apps.auditing",
 ]
@@ -204,6 +210,16 @@ OUTBOUND_HTTP_MAX_TIMEOUT_SECONDS = env.outbound_http_max_timeout_seconds
 # docs/decisions/0010-airflow-orchestration.md.
 # --------------------------------------------------------------------------
 ORCHESTRATION_API_TOKEN = env.orchestration_api_token
+
+# --------------------------------------------------------------------------
+# Spark-backed transform mode (apps.sparktransform). See
+# docs/decisions/0009-spark-backed-transform-mode.md.
+# --------------------------------------------------------------------------
+SPARK_JOB_BACKEND = env.spark_job_backend
+SPARK_AWS_REGION = env.spark_aws_region
+SPARK_EMR_APPLICATION_ID = env.spark_emr_application_id
+SPARK_EMR_EXECUTION_ROLE_ARN = env.spark_emr_execution_role_arn
+SPARK_JOB_ENTRY_POINT_S3_URI = env.spark_job_entry_point_s3_uri
 
 # --------------------------------------------------------------------------
 # Structured logging. Django's own framework logs go through the plain

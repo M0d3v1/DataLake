@@ -24,6 +24,7 @@ from apps.execution.claims import (
 )
 from apps.execution.models import PipelineRun, TaskExecution
 from apps.pipelines.mapping import map_records
+from apps.pipelines.models import Pipeline
 from apps.rawstore.service import store_raw_payload
 
 log = get_logger(__name__)
@@ -59,7 +60,7 @@ def run_pipeline(*, run_id: str, celery_task_id: str | None, is_final_attempt: b
     )
 
     try:
-        _execute(run)
+        completed_synchronously = _execute(run)
     except DataLakeError as exc:
         _record_failure(run, task_execution, exc, is_final_attempt=is_final_attempt)
         raise
@@ -71,42 +72,74 @@ def run_pipeline(*, run_id: str, celery_task_id: str | None, is_final_attempt: b
         _record_failure(run, task_execution, wrapped, is_final_attempt=is_final_attempt)
         raise wrapped from exc
     else:
-        _record_success(run, task_execution)
+        if completed_synchronously:
+            _record_success(run, task_execution)
+        else:
+            # Spark mode (see _execute below): this attempt succeeded at
+            # what it's responsible for -- extraction plus handing the
+            # run off to a Spark job -- but the run itself isn't finished.
+            # apps.sparktransform.services.finalize_spark_transform, via
+            # apps.sparktransform.tasks.poll_spark_transform_task, is what
+            # eventually calls mark_run_succeeded/mark_run_failed once the
+            # job reaches a terminal state.
+            _record_handoff(run, task_execution)
 
 
-def _execute(run: PipelineRun) -> None:
+def _execute(run: PipelineRun) -> bool:
+    """Returns True if `run` was fully completed synchronously (plain
+    Python mode), False if it was handed off to an async Spark transform
+    job (Spark mode -- see `_extract_only` and
+    `apps.sparktransform.services.submit_spark_transform`) and is not yet
+    finished."""
     pipeline = run.pipeline
     source_connection = pipeline.source_connection
     destination_connection = pipeline.destination_connection
 
-    mapping = pipeline.destination_mapping
-    if not mapping:
-        raise MappingError(f"pipeline {pipeline.id} has no destination_mapping configured")
-
     source_config = {**source_connection.config, **pipeline.extraction_config}
     source = get_source_connector(source_connection.connector_type, source_config)
-    destination = get_destination_connector(
-        destination_connection.connector_type, destination_connection.config
-    )
 
     # Credentials are resolved only right before the phase that needs
     # them, held only for the duration of this function, and never
     # written to the run/log -- see docs/decisions/0005-execution-orchestration.md.
     source_credential = _resolve_credential(source_connection)
-    destination_credential = _resolve_credential(destination_connection)
     try:
-        _extract_and_load(
-            run,
-            source,
-            destination,
-            mapping,
-            pipeline.strict_mapping,
-            source_credential,
-            destination_credential,
+        if pipeline.processing_mode == Pipeline.ProcessingMode.SPARK:
+            run.phase = PipelineRun.Phase.EXTRACTING
+            run.save(update_fields=["phase", "updated_at"])
+            _extract_only(run, source, source_credential)
+
+            # Deferred import: apps.sparktransform.services itself
+            # imports apps.execution.models/claims, so importing it at
+            # this module's top level would be a circular import between
+            # sibling TENANT_APPS -- see docs/decisions/0009-spark-backed-
+            # transform-mode.md.
+            from apps.sparktransform.services import submit_spark_transform
+
+            submit_spark_transform(run)
+            return False
+
+        mapping = pipeline.destination_mapping
+        if not mapping:
+            raise MappingError(f"pipeline {pipeline.id} has no destination_mapping configured")
+        destination = get_destination_connector(
+            destination_connection.connector_type, destination_connection.config
         )
+        destination_credential = _resolve_credential(destination_connection)
+        try:
+            _extract_and_load(
+                run,
+                source,
+                destination,
+                mapping,
+                pipeline.strict_mapping,
+                source_credential,
+                destination_credential,
+            )
+        finally:
+            del destination_credential
+        return True
     finally:
         del source_credential
-        del destination_credential
 
 
 def _extract_and_load(
@@ -171,6 +204,58 @@ def _extract_and_load(
         )
 
 
+def _extract_only(run: PipelineRun, source, source_credential: dict[str, Any]) -> None:
+    """The extraction half of `_extract_and_load`, for Spark-mode
+    pipelines: fetch and immutably raw-store every page, exactly as the
+    Python-mode path does, but stop there -- no in-process mapping, no
+    per-page `destination.load()` call, and `RawPayloadRecord.
+    loaded_successfully` stays False (its meaning is "successfully
+    loaded to the destination", which hasn't happened yet at extraction
+    time in Spark mode) -- `apps.sparktransform.services.
+    finalize_spark_transform` flips it True for every record in this run
+    once the Spark job's output is actually bulk-loaded.
+    `run.last_successful_cursor` still advances per page, so a retry of
+    *this* attempt (extraction failed partway, Spark was never
+    submitted) resumes exactly like Python mode does."""
+    cursor = run.last_successful_cursor
+    sequence = run.pages_extracted
+
+    for page in source.fetch(source_credential, cursor=cursor):
+        sequence += 1
+
+        store_raw_payload(
+            run,
+            sequence=sequence,
+            data=page.raw_payload,
+            content_type=page.raw_content_type,
+            cursor_used=page.cursor_used,
+            next_cursor=page.next_cursor,
+            item_count=len(page.records),
+            source_path=page.source_path or "",
+            http_status=page.http_status,
+        )
+
+        run.pages_extracted = sequence
+        run.records_extracted += len(page.records)
+        run.raw_payload_count += 1
+        run.last_successful_cursor = page.next_cursor or page.cursor_used
+        run.save(
+            update_fields=[
+                "pages_extracted",
+                "records_extracted",
+                "raw_payload_count",
+                "last_successful_cursor",
+                "updated_at",
+            ]
+        )
+        log.info(
+            "pipeline_run.page_extracted",
+            run_id=str(run.id),
+            sequence=sequence,
+            records_extracted=len(page.records),
+        )
+
+
 def _resolve_credential(connection: Connection) -> dict[str, Any]:
     try:
         credential_obj = connection.credential
@@ -191,6 +276,24 @@ def _record_success(run: PipelineRun, task_execution: TaskExecution) -> None:
         pages_extracted=run.pages_extracted,
         records_extracted=run.records_extracted,
         records_loaded=run.records_loaded,
+    )
+
+
+def _record_handoff(run: PipelineRun, task_execution: TaskExecution) -> None:
+    """Spark mode only: this attempt's job -- extract every page, submit
+    the transform job -- succeeded, but `run` itself is still RUNNING
+    (phase=TRANSFORMING). Unlike `_record_success`, this never touches
+    `PipelineRun.status`: that only happens later, in
+    `apps.sparktransform.services.finalize_spark_transform`."""
+    task_execution.status = TaskExecution.Status.SUCCEEDED
+    task_execution.finished_at = timezone.now()
+    task_execution.save(update_fields=["status", "finished_at", "updated_at"])
+    log.info(
+        "pipeline_run.handed_off_to_spark",
+        run_id=str(run.id),
+        pages_extracted=run.pages_extracted,
+        records_extracted=run.records_extracted,
+        spark_job_id=run.spark_job_id,
     )
 
 

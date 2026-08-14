@@ -105,6 +105,73 @@ up once it's actually running.
    `PipelineRun` shows up in the operator UI / `manage.py run_pipeline
    --schema <tenant> ...`-equivalent history.
 
+## Configuring Spark-mode pipelines
+
+See [ADR 0009](decisions/0009-spark-backed-transform-mode.md) for the
+full design. Unlike Airflow, there is no local Spark service in
+`docker-compose.yml` to bring up -- the default backend
+(`apps.sparktransform.backends.emr_serverless.EmrServerlessBackend`)
+targets AWS EMR Serverless, a managed/serverless Spark platform,
+deliberately to avoid paying for an idle standing cluster (see the ADR's
+deployment rationale). That means exercising Spark mode for real needs
+an actual AWS account, not just `docker compose up`.
+
+**Honestly flagged, same caveat as Airflow above, more so:** this was
+built with no AWS account, no live EMR Serverless application, and no
+PySpark installation available -- `EmrServerlessBackend` and the actual
+PySpark driver (`spark_jobs/transform_job.py`) have only been
+syntax/type-checked, never run for real. The steps below get you to "a
+pipeline that will attempt to submit a real job" -- treat that submission
+itself as the first real test, and expect to debug it.
+
+1. Provision (outside this codebase, as a deployment step) an EMR
+   Serverless application and an execution IAM role with permissions to
+   read/write the raw payload S3 bucket, then upload
+   `spark_jobs/transform_job.py` to an S3 location.
+
+2. Set in `.env`:
+
+   ```bash
+   DATALAKE_SPARK_EMR_APPLICATION_ID=<your application id>
+   DATALAKE_SPARK_EMR_EXECUTION_ROLE_ARN=<your execution role ARN>
+   DATALAKE_SPARK_JOB_ENTRY_POINT_S3_URI=s3://<bucket>/transform_job.py
+   DATALAKE_SPARK_AWS_REGION=<your region>
+   ```
+
+   Also make sure the `web`/`worker` containers have real AWS credentials
+   available (an instance profile in production; `AWS_ACCESS_KEY_ID`/
+   `AWS_SECRET_ACCESS_KEY` env vars for local experimentation) -- boto3
+   picks these up the standard way, nothing DataLake-specific to
+   configure beyond the four settings above.
+
+3. Set a pipeline's `processing_mode` to `"spark"` and create its
+   `SparkTransformConfig` (`column_mappings`: `destination_column ->
+   {"source_field": ..., "transform_expr": ...}`, `transform_expr`
+   optional per column) -- via the shell for now, there's no config UI
+   yet:
+
+   ```bash
+   docker compose run --rm web python manage.py shell -c "
+   from apps.pipelines.models import Pipeline
+   from apps.sparktransform.models import SparkTransformConfig
+
+   pipeline = Pipeline.objects.get(id='<pipeline-id>')
+   pipeline.processing_mode = Pipeline.ProcessingMode.SPARK
+   pipeline.save(update_fields=['processing_mode'])
+   SparkTransformConfig.objects.create(
+       pipeline=pipeline,
+       column_mappings={'policy_id': {'source_field': 'id', 'transform_expr': None}},
+   )
+   "
+   ```
+
+4. Trigger the pipeline as usual (`manage.py run_pipeline` or the
+   operator UI's continuation-adjacent run-detail page). Extraction runs
+   exactly as it does in Python mode; once it finishes, watch
+   `PipelineRun.spark_job_id`/`spark_job_status` for the submitted job's
+   progress, and the EMR Serverless console/CloudWatch logs for the
+   job's own output.
+
 ## Creating your first organization (tenant)
 
 Every piece of domain data (connections, pipelines, runs) belongs to an

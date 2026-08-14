@@ -14,6 +14,7 @@ and the platform recording that success.
 """
 
 import re
+import uuid
 from typing import Any
 
 import sqlalchemy as sa
@@ -29,6 +30,7 @@ from apps.core.exceptions import (
 )
 
 DEFAULT_BATCH_SIZE = 500
+DEFAULT_BULK_BATCH_SIZE = 2000
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 
@@ -57,7 +59,7 @@ class SqlServerDestinationConnector(DestinationConnector):
 
     type_key = "sqlserver"
     capabilities = DestinationCapabilities(
-        supports_upsert=False, supports_guided_schema_creation=False
+        supports_upsert=False, supports_guided_schema_creation=False, supports_bulk_load=True
     )
 
     def _build_url(self, credential: dict[str, Any]) -> sa.engine.URL:
@@ -137,6 +139,79 @@ class SqlServerDestinationConnector(DestinationConnector):
         except sa.exc.IntegrityError as exc:
             raise LoadFailed(
                 f"integrity constraint violated during load: {exc}", retryable=False
+            ) from exc
+        except sa.exc.SQLAlchemyError as exc:
+            raise LoadFailed(str(exc), retryable=False) from exc
+        finally:
+            engine.dispose()
+
+    def bulk_load(
+        self, credential: dict[str, Any], records: list[dict[str, Any]], *, mode: str = "append"
+    ) -> int:
+        """Same validation and outcome as `load()`, but writes through a
+        temporary staging table (created from the destination table's own
+        shape, dropped again in the same transaction) with a larger batch
+        size, then moves everything into the destination with one
+        `INSERT ... SELECT`, rather than many small single-table
+        transactions. Real bulk-copy semantics (SQL Server reading
+        directly from a file/blob) are future work -- see the docstring
+        on `DestinationConnector.bulk_load`."""
+        if mode != "append":
+            raise UnsupportedCapability(
+                f"{self.type_key} destination connector only supports mode='append' "
+                f"(got {mode!r}); upsert/CDC are deliberately deferred, see the roadmap"
+            )
+        if not records:
+            return 0
+
+        schema_name = _validate_sql_identifier(
+            self.config.get("schema_name", "dbo"), label="schema_name"
+        )
+        table_name = _validate_sql_identifier(self.config["table_name"], label="table_name")
+        batch_size = self.config.get("bulk_batch_size", DEFAULT_BULK_BATCH_SIZE)
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+            raise ConfigurationError(
+                "sqlserver destination: 'bulk_batch_size' must be a positive integer"
+            )
+        # Generated, not tenant-supplied -- still validated for defense
+        # in depth, since it's about to be interpolated into DDL/DML text
+        # that SQLAlchemy's query builder can't parameterize an
+        # identifier into.
+        staging_table_name = _validate_sql_identifier(
+            f"__bulk_staging_{uuid.uuid4().hex[:12]}", label="staging_table_name"
+        )
+
+        engine = self._engine(credential)
+        try:
+            table = self._reflect_table(engine, schema_name, table_name)
+            self._validate_columns(table, records, schema_name, table_name)
+
+            qualified_table = f"[{schema_name}].[{table_name}]"
+            qualified_staging = f"[{schema_name}].[{staging_table_name}]"
+            with engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        f"SELECT TOP 0 * INTO {qualified_staging} FROM {qualified_table}"
+                    )
+                )
+                staging_table = sa.Table(
+                    staging_table_name, sa.MetaData(schema=schema_name), autoload_with=conn
+                )
+                for start in range(0, len(records), batch_size):
+                    batch = records[start : start + batch_size]
+                    conn.execute(sa.insert(staging_table), batch)
+                conn.execute(
+                    sa.text(f"INSERT INTO {qualified_table} SELECT * FROM {qualified_staging}")
+                )
+                conn.execute(sa.text(f"DROP TABLE {qualified_staging}"))
+            return len(records)
+        except sa.exc.OperationalError as exc:
+            raise LoadFailed(
+                f"database connectivity error during bulk load: {exc}", retryable=True
+            ) from exc
+        except sa.exc.IntegrityError as exc:
+            raise LoadFailed(
+                f"integrity constraint violated during bulk load: {exc}", retryable=False
             ) from exc
         except sa.exc.SQLAlchemyError as exc:
             raise LoadFailed(str(exc), retryable=False) from exc

@@ -27,12 +27,16 @@ sanitization before logging, and the Django 5.2 LTS upgrade. Most
 recently, a minimal internal operator UI (Django templates + HTMX) made
 two previously shell-only workflows -- raw payload storage migration and
 pipeline-run continuation -- reachable without shell access (see
-[ADR 0008](decisions/0008-internal-operator-ui.md)), and a self-hosted
+[ADR 0008](decisions/0008-internal-operator-ui.md)), a self-hosted
 Airflow instance now provides real scheduling and orchestration (see
-[ADR 0010](decisions/0010-airflow-orchestration.md); [ADR 0009](decisions/0009-spark-backed-transform-mode.md)
-scopes a still-unbuilt, opt-in Spark transform mode Airflow will also
-orchestrate once it exists). This document reflects the current state
-and notes what's deliberately still deferred.
+[ADR 0010](decisions/0010-airflow-orchestration.md)), and an opt-in,
+per-pipeline Spark-backed transform mode (see
+[ADR 0009](decisions/0009-spark-backed-transform-mode.md)) lets a
+pipeline that genuinely needs distributed transforms hand off to Spark
+after extraction instead of the default in-process mapper. This document
+reflects the current state and notes what's deliberately still deferred
+-- Airflow and Spark are both flagged there as built but not yet
+runtime-verified against a live cluster/account.
 
 ## Process topology
 
@@ -53,12 +57,24 @@ settings, plus a fully separate Airflow deployment:
   touching its database directly. See
   [ADR 0010](decisions/0010-airflow-orchestration.md).
 
+For a Spark-mode pipeline (`Pipeline.processing_mode == "spark"`, see
+[ADR 0009](decisions/0009-spark-backed-transform-mode.md)), **worker**'s
+job stops at extraction -- it hands off to a Spark job submitted against
+`apps.sparktransform.backends.base.SparkJobBackend` (AWS EMR Serverless
+by default) and a second Celery task, `poll_spark_transform_task`,
+watches for that job's terminal status. Unlike Airflow, this Spark
+backend is *not* one more container in `docker-compose.yml` -- it's an
+external managed/serverless service (deliberately, to avoid paying for
+an idle standing cluster; see the ADR), so there's nothing to add to the
+process topology here beyond the extra Celery task.
+
 Infrastructure: PostgreSQL (platform metadata, one instance, many schemas
 for this platform's own data -- see multi-tenancy below -- plus one
 separate *database* for Airflow's own metadata), RabbitMQ (broker for
 both this platform's Celery app and, on a separate queue, Airflow's own
-CeleryExecutor), MinIO/S3 (raw payload storage). All defined in
-`docker-compose.yml` for local development.
+CeleryExecutor), MinIO/S3 (raw payload storage, and -- for Spark-mode
+pipelines -- the input Spark reads from and the transformed output it
+writes back). All defined in `docker-compose.yml` for local development.
 
 ## Multi-tenancy: schema-per-tenant
 
@@ -86,8 +102,9 @@ internals.
 | `authproviders` | `AuthProvider` interface + built-in providers (API key, Basic, Bearer, token-endpoint, multi-step) |
 | `connectors` | `SourceConnector` / `DestinationConnector` interfaces + registry + built-in connectors (REST API source, SQL Server destination) |
 | `connections` | `Connection` (which connector + config), `Credential` (which auth provider + secret ref), `AllowedOutboundHost` (tenant-level outbound policy allowlist) |
-| `pipelines` | `Pipeline` (source, destination, mapping, schedule) + `apps.pipelines.mapping` |
+| `pipelines` | `Pipeline` (source, destination, mapping, schedule, `processing_mode`) + `apps.pipelines.mapping` |
 | `execution` | `PipelineRun`, `TaskExecution`, `apps.execution.orchestration`/`claims`/`dispatch`/`retry_policy`, the Celery task |
+| `sparktransform` | `SparkTransformConfig`, the whitelisted `transform_expr` grammar (`apps.sparktransform.expr`), `SparkJobBackend` interface + `EmrServerlessBackend`, job submission/finalization services, `poll_spark_transform_task` -- opt-in per pipeline, see [ADR 0009](decisions/0009-spark-backed-transform-mode.md) |
 | `rawstore` | `RawPayloadStore` interface + S3/MinIO backend, `RawPayloadRecord` metadata, `apps.rawstore.migration` (legacy-key migration service) |
 | `auditing` | `AuditLog` + `record_audit_event()` |
 | `opsui` | Internal operator UI: `RawPayloadMigrationJob` (public schema), permissions, views/urls/templates for raw payload migration and pipeline run/continuation -- see [ADR 0008](decisions/0008-internal-operator-ui.md) |
@@ -284,16 +301,16 @@ extract/load steps and across processes.
 ## What's deliberately not here yet
 
 See `docs/roadmap.md` for the full list with rationale. In short:
-Spark-backed distributed transforms for high-volume pipelines (ADR 0009,
-scoped but not built), PostgreSQL source/destination connectors, SQL
-Server *source* queries, guided destination table/index/relationship
-design, upsert/CDC and incremental watermarks across runs, unrestricted
-custom SQL, a self-service normal-user web UI (configuring
-connections/pipelines -- distinct from the internal operator UI, which
-now exists), production secret-manager integration, and analytics
-dashboards. Restricted advanced SQL execution in particular is
-deliberately deferred pending its own design review -- it's the
-highest-risk feature in the product (see the Milestone 1 design
-proposal's risk list). Scheduling/orchestration itself is no longer on
-this list -- it's built via self-hosted Airflow (ADR 0010), though still
-flagged in the roadmap as not yet runtime-verified end to end.
+PostgreSQL source/destination connectors, SQL Server *source* queries,
+guided destination table/index/relationship design, upsert/CDC and
+incremental watermarks across runs, unrestricted custom SQL, a
+self-service normal-user web UI (configuring connections/pipelines --
+distinct from the internal operator UI, which now exists), production
+secret-manager integration, and analytics dashboards. Restricted advanced
+SQL execution in particular is deliberately deferred pending its own
+design review -- it's the highest-risk feature in the product (see the
+Milestone 1 design proposal's risk list). Scheduling/orchestration and
+the opt-in Spark transform mode are no longer on this list -- both are
+built (self-hosted Airflow, ADR 0010; `apps.sparktransform`, ADR 0009),
+though both are still flagged in the roadmap as not yet runtime-verified
+against a live cluster/account.

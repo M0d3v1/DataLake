@@ -24,6 +24,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from apps.core.exceptions import UnsupportedCapability
+
 
 @dataclass(frozen=True)
 class SourceCapabilities:
@@ -79,6 +81,12 @@ class DestinationMapping:
 class DestinationCapabilities:
     supports_upsert: bool = False
     supports_guided_schema_creation: bool = False
+    # Whether bulk_load() below is implemented -- required for a
+    # pipeline to run in Spark mode (Pipeline.processing_mode == SPARK),
+    # checked at job-submission time by
+    # apps.sparktransform.services.validate_spark_transform_config. See
+    # docs/decisions/0009-spark-backed-transform-mode.md.
+    supports_bulk_load: bool = False
 
 
 class DestinationConnector(ABC):
@@ -106,3 +114,27 @@ class DestinationConnector(ABC):
         self, credential: dict[str, Any], records: list[dict[str, Any]], *, mode: str = "append"
     ) -> int:
         """Write `records` to the destination, return the count written."""
+
+    def bulk_load(
+        self, credential: dict[str, Any], records: list[dict[str, Any]], *, mode: str = "append"
+    ) -> int:
+        """Write `records` (already destination-shaped, e.g. a Spark
+        transform job's output) using a faster bulk mechanism than
+        `load()`'s per-batch inserts -- same interface, same audit hooks,
+        a different implementation underneath (for SQL Server: a staging
+        table + one bulk copy + one INSERT...SELECT, all in a single
+        transaction, rather than many small ones). Required for a
+        pipeline to run in Spark mode -- see
+        `capabilities.supports_bulk_load` and
+        docs/decisions/0009-spark-backed-transform-mode.md.
+
+        Default implementation raises `UnsupportedCapability`; connectors
+        that support bulk loading must override this and set
+        `capabilities.supports_bulk_load = True`.
+
+        Note on scope: like `load()`, this still stages `records` as an
+        in-memory Python list -- it is not (yet) a true out-of-core bulk
+        transfer where the destination reads directly from object
+        storage. That's real future work, not pretended-away here.
+        """
+        raise UnsupportedCapability(f"{type(self).__name__} does not support bulk load")
